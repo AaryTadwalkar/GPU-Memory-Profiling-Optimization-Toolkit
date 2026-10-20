@@ -1,0 +1,28 @@
+{
+  "summary": {
+    "budget_bytes": 6442450944,
+    "max_allocated_bytes": 188743680,
+    "max_reserved_bytes": 209715200,
+    "peak_memory_bytes": 188743680,
+    "max_cached_unused_bytes": 104857600,
+    "peak_to_capacity_ratio": 0.029296875,
+    "positive_deltas_count": 4,
+    "negative_deltas_count": 1,
+    "total_events_analyzed": 29,
+    "valid_samples": 29,
+    "workload_name": "unknown_workload",
+    "precision": "FP32",
+    "batch_size": null
+  },
+  "recommendations": [
+    {
+      "rule_id": "OPT-BATCH-002",
+      "category": "Batch Size Adjustment",
+      "triggering_metric": "peak_to_capacity_ratio",
+      "measured_value": "2.93% (180.0 MB / 6144.0 MB)",
+      "threshold": "< 35%",
+      "recommendation": "Consider increasing batch size to achieve higher GPU memory and compute saturation.",
+      "caveat": "Larger batches increase peak memory proportionally; verify headroom before full-scale deployment."
+    }
+  ]
+}

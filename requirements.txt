@@ -1,0 +1,24 @@
+# GPU Memory Profiling & Optimization Toolkit - Dependencies
+# Install into your local virtual environment:
+#   python -m venv .venv
+#   .venv\Scripts\activate   (Windows PowerShell)
+#   pip install -r requirements.txt
+
+# Core device and in-process telemetry
+pynvml>=11.5.0
+nvidia-ml-py>=12.535.133
+
+# PyTorch (For CUDA GPU laptops RTX 3050/4050, ensure PyTorch with CUDA support is installed:
+# e.g., pip install torch --index-url https://download.pytorch.org/whl/cu121 or cu118)
+# For CPU-only laptop (Person 3), standard torch or CPU-only torch is sufficient.
+torch>=2.0.0
+
+# Data processing and numerical analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Dashboard visualization (Person 3)
+streamlit>=1.30.0
+
+# Automated testing suite
+pytest>=7.4.0

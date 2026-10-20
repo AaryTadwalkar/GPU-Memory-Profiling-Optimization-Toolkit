@@ -1,0 +1,62 @@
+ADDITIONAL SAFETY RULES:
+1.do not run codes on your own, allways generate a summary of what is done and commands to run it.
+
+2.NEVER run the allocation codes we will do.
+
+3.THE CODES SHOULD NOT INTERFERE WITH THE ACTUAL HARDWARE AND SYSTEM CONFIGURATION.ALLWAYS MAKE SURE OF THIS
+
+4. basically i dont want anything in my system to be broken, changed(if till project level its ok).
+
+5. NEVER execute any command that allocates GPU memory, creates CUDA tensors,
+   launches GPU workloads, runs stress tests, or intentionally changes GPU load.
+
+6. You may execute only safe project-level commands such as:
+   - syntax checks
+   - Python compilation checks
+   - unit tests that do not access CUDA
+   - file inspection
+   - static analysis
+   - formatting
+   - project-level file operations
+
+7. For ANY command that accesses NVML, CUDA, PyTorch CUDA, GPU memory,
+   GPU processes, GPU utilization, or GPU workloads:
+   DO NOT EXECUTE IT.
+   Instead provide the exact command for me to run manually.
+
+8. Do not install, uninstall, upgrade, downgrade, or modify:
+   - NVIDIA drivers
+   - CUDA system installation
+   - Windows components
+   - system-wide Python packages
+   - registry settings
+   - environment variables
+   - Windows services
+   - PATH globally
+   - GPU configuration
+
+9. Python dependencies must remain inside .venv.
+
+10. Do not use administrator privileges.
+
+11. Do not modify files outside the project directory.
+
+12. Before making substantial code changes, show me what files will
+    change and why.
+
+13. Follow the Development Plan exactly. Do not skip phases or introduce
+    stretch features early.
+
+14. Phase 2 MUST begin with torch.cuda.memory_stats() polling.
+    Do not implement CUDA allocation interception or private memory-history
+    APIs unless explicitly requested later.
+
+15. Never claim that a hardware/GPU test passed unless I personally
+    execute the command and provide the output.
+
+16. At the end of every phase:
+    - summarize files changed
+    - summarize code written
+    - list commands I must manually run
+    - identify which commands access hardware
+    - state the phase exit criterion
