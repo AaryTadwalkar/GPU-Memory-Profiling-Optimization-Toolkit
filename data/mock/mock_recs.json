@@ -1,0 +1,55 @@
+{
+  "summary": {
+    "budget_bytes": 6442450944,
+    "max_allocated_bytes": 4831838208,
+    "max_reserved_bytes": 5905580032,
+    "peak_memory_bytes": 4831838208,
+    "max_cached_unused_bytes": 1073741824,
+    "peak_to_capacity_ratio": 0.75,
+    "positive_deltas_count": 84,
+    "negative_deltas_count": 42,
+    "total_events_analyzed": 140,
+    "valid_samples": 140,
+    "workload_name": "ResNet50_Training",
+    "precision": "FP32",
+    "batch_size": 64
+  },
+  "recommendations": [
+    {
+      "rule_id": "OPT-PREC-001",
+      "category": "Mixed Precision",
+      "triggering_metric": "precision + peak_memory",
+      "measured_value": "FP32 with 4608 MB peak (75.0% of 6144 MB budget)",
+      "threshold": "FP32 active and peak > 60% of budget",
+      "recommendation": "Switch to FP16 mixed precision using torch.cuda.amp.autocast() to reduce activation and weight footprint.",
+      "caveat": "Mixed precision may require torch.cuda.amp.GradScaler to prevent gradient underflow during training."
+    },
+    {
+      "rule_id": "OPT-CACHE-001",
+      "category": "Allocator Caching",
+      "triggering_metric": "max_cached_unused_bytes",
+      "measured_value": "1024.0 MB cached-but-unused (18.2% of reserved)",
+      "threshold": "> 512 MB cached-but-unused",
+      "recommendation": "Invoke torch.cuda.empty_cache() between validation epochs or major training phases to release unused cached segments.",
+      "caveat": "Frequent empty_cache() calls incur CUDA runtime synchronization overhead; use at epoch boundaries only."
+    },
+    {
+      "rule_id": "OPT-CKPT-001",
+      "category": "Gradient Checkpointing",
+      "triggering_metric": "peak_to_capacity_ratio",
+      "measured_value": "75.0% peak-to-capacity",
+      "threshold": "> 65% for training workloads",
+      "recommendation": "Apply torch.utils.checkpoint on intermediate feature blocks to trade recomputation for activation memory.",
+      "caveat": "Increases training compute time by ~20-30% while reducing activation memory by up to 50%."
+    },
+    {
+      "rule_id": "OPT-BATCH-001",
+      "category": "Batch Size Adjustment",
+      "triggering_metric": "peak_to_capacity_ratio",
+      "measured_value": "75.0% peak-to-capacity (headroom: 1536 MB)",
+      "threshold": "> 70% with safety margin 512 MB",
+      "recommendation": "Consider decreasing batch size from 64 to 48 if multi-process contention is anticipated.",
+      "caveat": "Lowering batch size may slightly reduce hardware compute utilization."
+    }
+  ]
+}

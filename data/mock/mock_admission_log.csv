@@ -1,0 +1,6 @@
+timestamp,workload_id,workload_name,requested_bytes,decision,budget_bytes,safety_margin_bytes,available_headroom_bytes,observed_peak_bytes,error_bytes,status,notes
+1792862949.8071554,wl-001,ResNet18_Inference,1073741824,ADMIT,6442450944,536870912,5120000000,1024000000,-49741824,SUCCESS,Request fits safely within available headroom.
+1792863189.8071554,wl-002,BERT_Base_FineTune,2684354560,ADMIT,6442450944,536870912,4046258176,2810000000,125645440,SUCCESS,Admitted alongside wl-001. Slight underestimation of peak.
+1792863489.8071554,wl-003,LLaMA_7B_LoRA,3758096384,DEFER,6442450944,536870912,1361903616,,,DEFERRED,Temporarily deferred: current reservations exceed safe headroom.
+1792863789.8071554,wl-004,Gigantic_Diffusion_Model,7516192768,REJECT,6442450944,536870912,5368709120,,,REJECTED,Rejected: requested memory exceeds total device budget.
+1792864089.8071554,wl-005,Vision_Transformer_Eval,1610612736,ADMIT,6442450944,536870912,4294967296,1580000000,-30612736,SUCCESS,Admitted following release of wl-001 and wl-002.

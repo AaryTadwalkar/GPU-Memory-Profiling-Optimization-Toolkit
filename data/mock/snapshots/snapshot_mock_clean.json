@@ -1,0 +1,18 @@
+{
+  "device": 0,
+  "segments": [
+    {
+      "device": 0,
+      "address": 140000000000,
+      "total_size": 104857600,
+      "allocated_size": 104857600,
+      "blocks": [
+        {
+          "size": 104857600,
+          "state": "active_allocated",
+          "requested_size": 104857600
+        }
+      ]
+    }
+  ]
+}

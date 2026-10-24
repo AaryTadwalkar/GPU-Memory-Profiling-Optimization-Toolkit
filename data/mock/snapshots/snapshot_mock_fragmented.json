@@ -1,0 +1,113 @@
+{
+  "device": 0,
+  "segments": [
+    {
+      "device": 0,
+      "address": 140000000000,
+      "total_size": 209715200,
+      "allocated_size": 104857600,
+      "blocks": [
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        },
+        {
+          "size": 10485760,
+          "state": "active_allocated",
+          "requested_size": 10485760
+        },
+        {
+          "size": 10485760,
+          "state": "inactive",
+          "requested_size": 0
+        }
+      ]
+    }
+  ]
+}
