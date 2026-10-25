@@ -38,7 +38,7 @@ pip install -r requirements.txt
 ---
 
 ### 2. Run Automated Test Suite
-Run all 191 unit tests across all project phases without touching hardware:
+Run all 193 unit tests across all project phases without touching hardware:
 
 ```bash
 # Via pytest
@@ -48,12 +48,12 @@ pytest tests/
 python run_tests.py
 ```
 
-All 191 unit tests run in ~2.5 seconds on CPU.
+All 193 unit tests run in ~2.5 seconds on CPU.
 
 ---
 
 ### 3. Launch the Interactive Streamlit Dashboard (Phase 6)
-Start the multi-tab interactive web dashboard:
+Start the multi-tab interactive web dashboard (automatically detects your physical NVIDIA GPU and starts in real-time live telemetry mode):
 
 ```bash
 python run.py dashboard
@@ -144,7 +144,7 @@ GPU-Memory-Profiling-Optimization-Toolkit/
 ├── workloads/                            # Synthetic & diagnostic workloads
 │   ├── memory_stress.py                  # Allocation stress testing
 │   └── memory_fragmentation.py           # Controlled alternating tensor fragmentation test
-├── tests/                                # Automated unit test suites (191 tests)
+├── tests/                                # Automated unit test suites (193 tests)
 │   ├── test_schema.py                    # Phase 0.5: Schema & serialization tests
 │   ├── test_memory_pressure.py           # Phase 2: Pressure & OOM heuristics tests
 │   ├── test_admission_control.py         # Phase 4: Admission controller tests

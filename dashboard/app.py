@@ -43,6 +43,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Safe NVML import for real-time hardware telemetry
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
+
 # ---------------------------------------------------------------------------
 # Project root on sys.path
 # ---------------------------------------------------------------------------
@@ -80,8 +87,142 @@ from dashboard.components import (
 )
 
 
+
+# ---------------------------------------------------------------------------
+# Hardware Detection Helpers
+# ---------------------------------------------------------------------------
+
+def detect_system_gpu() -> Optional[Dict[str, Any]]:
+    """
+    1. The use of function:
+       Auto-detects the host system's physical NVIDIA GPU via NVML.
+    2. How does the specific function work:
+       Attempts to initialize pynvml, queries device count, and extracts
+       the primary GPU handle, device name, total VRAM capacity, and driver version.
+       Returns None if NVML is unavailable or no NVIDIA GPU is present.
+    3. Concepts used in the function:
+       Hardware introspection, graceful degradation for CPU-only systems.
+    4. Places where this function is imported and used:
+       Called at dashboard startup to auto-configure live telemetry and default budgets.
+    5. Final output of the function, before and after:
+       Before: Unknown host hardware environment.
+       After: Dictionary with GPU metadata or None if CPU-only.
+    """
+    if pynvml is None:
+        return None
+    try:
+        pynvml.nvmlInit()
+        count = pynvml.nvmlDeviceGetCount()
+        if count > 0:
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            name = pynvml.nvmlDeviceGetName(h)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            try:
+                driver = pynvml.nvmlSystemGetDriverVersion()
+                if isinstance(driver, bytes):
+                    driver = driver.decode("utf-8", errors="replace")
+            except Exception:
+                driver = "Unknown"
+            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+            return {
+                "available": True,
+                "handle": h,
+                "name": str(name),
+                "driver": str(driver),
+                "total_bytes": int(mem.total),
+                "total_mb": float(mem.total) / (1024.0 * 1024.0),
+                "total_gb": float(mem.total) / (1024.0 * 1024.0 * 1024.0),
+                "device_count": int(count),
+            }
+    except Exception:
+        return None
+    return None
+
+
+def get_live_gpu_processes(handle) -> List[Dict[str, Any]]:
+    """
+    1. The use of function:
+       Queries all active processes utilizing the GPU across both graphics and compute modes.
+    2. How does the specific function work:
+       Calls nvmlDeviceGetGraphicsRunningProcesses and nvmlDeviceGetComputeRunningProcesses,
+       resolves each PID to its executable name via nvmlSystemGetProcessName, classifies
+       the workload type (Game/Graphics vs CUDA Compute), and safely formats VRAM usage.
+    3. Concepts used in the function:
+       OS process tracking, WDDM graphics vs compute boundary separation.
+    4. Places where this function is imported and used:
+       Used in Tab 1 (Device Overview) and Tab 4 (Contention) during live monitoring.
+    5. Final output of the function, before and after:
+       Before: Raw NVML process structs.
+       After: List of normalized process dictionaries ready for DataFrame display.
+    """
+    if pynvml is None or handle is None:
+        return []
+    procs: List[Dict[str, Any]] = []
+    seen_pids = set()
+
+    # 1. Compute processes (PyTorch, CUDA, etc.)
+    try:
+        c_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        for p in c_procs:
+            pid = p.pid
+            seen_pids.add(pid)
+            p_name = "Unknown"
+            try:
+                raw_name = pynvml.nvmlSystemGetProcessName(pid)
+                if isinstance(raw_name, bytes):
+                    raw_name = raw_name.decode("utf-8", errors="replace")
+                p_name = Path(str(raw_name)).name
+            except Exception:
+                p_name = f"Process {pid}"
+            vram_bytes = getattr(p, "usedGpuMemory", None)
+            vram_str = f"{vram_bytes / (1024.0 * 1024.0):.1f} MiB" if vram_bytes else "Active"
+            procs.append({
+                "PID": pid,
+                "Process Name": p_name,
+                "Subsystem": "⚡ CUDA / Compute",
+                "VRAM Usage": vram_str,
+            })
+    except Exception:
+        pass
+
+    # 2. Graphics processes (DirectX/Vulkan games, browser, Windows DWM)
+    try:
+        g_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+        for p in g_procs:
+            pid = p.pid
+            p_name = "Unknown"
+            try:
+                raw_name = pynvml.nvmlSystemGetProcessName(pid)
+                if isinstance(raw_name, bytes):
+                    raw_name = raw_name.decode("utf-8", errors="replace")
+                p_name = Path(str(raw_name)).name
+            except Exception:
+                p_name = f"Process {pid}"
+            vram_bytes = getattr(p, "usedGpuMemory", None)
+            vram_str = f"{vram_bytes / (1024.0 * 1024.0):.1f} MiB" if vram_bytes else "Shared/OS"
+            if pid in seen_pids:
+                for item in procs:
+                    if item["PID"] == pid:
+                        item["Subsystem"] = "🎮 Graphics + Compute"
+                        if vram_bytes:
+                            item["VRAM Usage"] = vram_str
+            else:
+                procs.append({
+                    "PID": pid,
+                    "Process Name": p_name,
+                    "Subsystem": "🎮 Graphics / Game / UI",
+                    "VRAM Usage": vram_str,
+                })
+    except Exception:
+        pass
+
+    return procs
+
+
 # ---------------------------------------------------------------------------
 # Streamlit Page Setup
+
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="GPU Memory Profiling & Optimization Toolkit",
@@ -98,28 +239,59 @@ apply_custom_css()
 st.sidebar.title("⚡ GPU Profiling Toolkit")
 st.sidebar.caption("OS-Oriented GPU Resource Management")
 
+# Hardware Detection
+gpu_hardware = detect_system_gpu()
+
+if gpu_hardware:
+    mode_options = [
+        "🔴 Live GPU (Real-Time NVML)",
+        "Recorded Profiles (data/profiles/)",
+        "Mock Simulation (data/mock/)",
+        "Upload CSV / JSON",
+    ]
+    default_mode_index = 0
+else:
+    mode_options = [
+        "Recorded Profiles (data/profiles/)",
+        "Mock Simulation (data/mock/)",
+        "Upload CSV / JSON",
+    ]
+    default_mode_index = 0
+
 data_source_mode = st.sidebar.radio(
     "Data Source Mode",
-    ["Recorded Profiles (data/profiles/)", "Mock Simulation (data/mock/)", "Upload CSV / JSON"],
-    index=0,
+    mode_options,
+    index=default_mode_index,
 )
 
 # Hardware and Memory Budget Configuration
 st.sidebar.markdown("---")
 st.sidebar.subheader("Hardware & Budget Configuration")
 
-gpu_target = st.sidebar.selectbox(
-    "Target Hardware",
-    ["NVIDIA RTX 4050 (6 GB)", "NVIDIA RTX 3050 (6 GB)", "Custom Budget"],
-    index=0,
-)
+if gpu_hardware:
+    st.sidebar.success(f"🟢 **Detected:** {gpu_hardware['name']}")
+    st.sidebar.caption(f"Driver: `{gpu_hardware['driver']}` | Hardware VRAM: `{gpu_hardware['total_gb']:.2f} GiB`")
+    hardware_choices = [
+        f"Auto: {gpu_hardware['name']}",
+        "NVIDIA RTX 4050 (6 GB)",
+        "NVIDIA RTX 3050 (6 GB)",
+        "Custom Budget",
+    ]
+else:
+    st.sidebar.info("ℹ️ Running in CPU-safe mode (no NVIDIA GPU detected).")
+    hardware_choices = ["NVIDIA RTX 4050 (6 GB)", "NVIDIA RTX 3050 (6 GB)", "Custom Budget"]
+
+gpu_target = st.sidebar.selectbox("Target Hardware Profile", hardware_choices, index=0)
 
 if gpu_target == "Custom Budget":
     budget_gb = st.sidebar.slider("Configured Memory Budget (GiB)", 1.0, 24.0, 6.0, 0.5)
+    budget_bytes = int(budget_gb * 1024 * 1024 * 1024)
+elif gpu_hardware and gpu_target.startswith("Auto:"):
+    budget_bytes = int(gpu_hardware["total_bytes"])
+    budget_gb = float(gpu_hardware["total_gb"])
 else:
     budget_gb = 6.0
-
-budget_bytes = int(budget_gb * 1024 * 1024 * 1024)
+    budget_bytes = int(budget_gb * 1024 * 1024 * 1024)
 
 safety_margin_pct = st.sidebar.slider("Admission Safety Margin (%)", 5, 30, 15, 5)
 safety_margin_bytes = int(budget_bytes * (safety_margin_pct / 100.0))
@@ -127,13 +299,34 @@ safety_margin_bytes = int(budget_bytes * (safety_margin_pct / 100.0))
 st.sidebar.markdown(
     f"""
     <div style="font-size: 0.8rem; color: #888888; margin-top: 4px;">
-        • <strong>Budget:</strong> {budget_gb:.1f} GiB ({format_bytes(budget_bytes)})<br>
+        • <strong>Budget:</strong> {budget_gb:.2f} GiB ({format_bytes(budget_bytes)})<br>
         • <strong>Safety Margin:</strong> {safety_margin_pct}% ({format_bytes(safety_margin_bytes)})<br>
         • <strong>Safe Headroom Cap:</strong> {format_bytes(budget_bytes - safety_margin_bytes)}
     </div>
     """,
     unsafe_allow_html=True,
 )
+
+# Live Polling Controls
+auto_refresh = True
+polling_rate_sec = 1
+rolling_window_sec = 60
+
+if data_source_mode.startswith("🔴 Live GPU"):
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔴 Live Polling Controls")
+    auto_refresh = st.sidebar.toggle("Auto-Refresh Telemetry", value=True)
+    polling_rate_sec = st.sidebar.selectbox(
+        "Polling Frequency",
+        [1, 2, 5],
+        index=0,
+        format_func=lambda s: f"Every {s} second{'s' if s > 1 else ''}",
+    )
+    rolling_window_sec = st.sidebar.slider("Rolling History Window", 15, 120, 60, 15, format="%d seconds")
+    if st.sidebar.button("🧹 Clear Rolling History"):
+        st.session_state["live_history"] = []
+        st.session_state["live_start_time"] = time.time()
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Data Resolution based on selected mode
@@ -145,7 +338,14 @@ uploaded_df = pd.DataFrame()
 uploaded_json_data: Optional[Dict[str, Any]] = None
 uploaded_file = None
 
-if data_source_mode == "Recorded Profiles (data/profiles/)":
+if data_source_mode.startswith("🔴 Live GPU"):
+    baseline_csv = None
+    torch_csv = PROFILES_DIR / "torch_events.csv" if (PROFILES_DIR / "torch_events.csv").is_file() else None
+    contention_csv = None
+    recs_json = PROFILES_DIR / "recs.json" if (PROFILES_DIR / "recs.json").is_file() else None
+    snapshot_dir = PROFILES_DIR / "snapshots"
+    benchmarks_csv = PROFILES_DIR / "benchmark_results.csv" if (PROFILES_DIR / "benchmark_results.csv").is_file() else None
+elif data_source_mode == "Recorded Profiles (data/profiles/)":
     baseline_csv = PROFILES_DIR / "baseline.csv"
     torch_csv = PROFILES_DIR / "torch_events.csv"
     contention_csv = PROFILES_DIR / "contention.csv"
@@ -258,7 +458,89 @@ with tab_device:
     st.subheader("🖥️ Device-Level GPU Memory Monitoring (NVML)")
     st.caption("Phase 1: Continuous out-of-process device memory headroom and utilization tracking.")
 
-    if not df_nvml.empty and "device_used_mb" in df_nvml.columns and df_nvml["device_used_mb"].notna().any():
+    if data_source_mode.startswith("🔴 Live GPU") and gpu_hardware:
+        refresh_interval_str = f"{polling_rate_sec}s" if auto_refresh else None
+
+        @st.fragment(run_every=refresh_interval_str)
+        def _render_live_view():
+            h = gpu_hardware["handle"]
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                util = pynvml.nvmlDeviceGetUtilizationRates(h)
+            except Exception as e:
+                st.error(f"Error querying live NVML: {e}")
+                return
+
+            temp = None
+            try:
+                temp = pynvml.nvmlDeviceGetTemperature(h, 0)
+            except Exception:
+                pass
+
+            now = time.time()
+            if "live_history" not in st.session_state:
+                st.session_state["live_history"] = []
+            if "live_start_time" not in st.session_state:
+                st.session_state["live_start_time"] = now
+
+            elapsed = round(now - st.session_state["live_start_time"], 1)
+            used_mb = round(mem.used / (1024.0 * 1024.0), 1)
+            free_mb = round(mem.free / (1024.0 * 1024.0), 1)
+            total_mb = round(mem.total / (1024.0 * 1024.0), 1)
+            util_pct = util.gpu
+            used_pct = round((mem.used / float(mem.total)) * 100.0, 1) if mem.total > 0 else 0.0
+
+            st.session_state["live_history"].append({
+                "timestamp": now,
+                "elapsed_s": elapsed,
+                "time_str": time.strftime("%H:%M:%S", time.localtime(now)),
+                "device_used_mb": used_mb,
+                "device_free_mb": free_mb,
+                "device_utilization_pct": util_pct,
+                "temperature_c": temp,
+            })
+            max_samples = max(10, int(rolling_window_sec / max(1, polling_rate_sec)))
+            st.session_state["live_history"] = st.session_state["live_history"][-max_samples:]
+
+            # 5 Live KPI Cards
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                render_kpi_card("Physical GPU", gpu_hardware["name"], f"Capacity: {total_mb/1024:.2f} GiB")
+            with col2:
+                render_kpi_card("Current Used VRAM", f"{used_mb:.1f} MiB", f"{used_pct}% VRAM load", color="#e74c3c")
+            with col3:
+                render_kpi_card("Current Free Headroom", f"{free_mb:.1f} MiB", "Available allocatable", color="#2ecc71")
+            with col4:
+                render_kpi_card("GPU SM Utilization", f"{util_pct}%", "Compute core activity", color="#00d2ff")
+            with col5:
+                t_str = f"{temp} °C" if temp is not None else "N/A"
+                t_col = "#e74c3c" if (temp and temp > 80) else "#2ecc71"
+                render_kpi_card("GPU Temperature", t_str, "Thermal reading", color=t_col)
+
+            # Live Timeseries Chart
+            st.markdown(f"#### Live Device VRAM Timeseries (Rolling Last {rolling_window_sec}s)")
+            df_live = pd.DataFrame(st.session_state["live_history"])
+            vram_chart = create_vram_timeline_chart(df_live)
+            st.altair_chart(vram_chart, width="stretch")
+
+            # Active Running Processes (Games, UI, CUDA)
+            st.markdown("#### Active GPU Processes (DirectX / Vulkan Games & CUDA Compute)")
+            procs = get_live_gpu_processes(h)
+            if procs:
+                st.dataframe(pd.DataFrame(procs), width="stretch")
+            else:
+                st.caption("No dedicated graphics or compute processes actively reported by NVML.")
+
+            st.markdown(
+                """
+                > **ℹ️ OS Resource Principle:** NVML communicates directly with the NVIDIA Kernel Driver.
+                > It monitors real physical VRAM allocations across **all system processes** (including 3D games,
+                > web browser hardware acceleration, Windows DWM, and PyTorch training).
+                """
+            )
+
+        _render_live_view()
+    elif not df_nvml.empty and "device_used_mb" in df_nvml.columns and df_nvml["device_used_mb"].notna().any():
         summary_nvml = compute_profile_summary(df_nvml, budget_bytes)
 
         col1, col2, col3, col4 = st.columns(4)
@@ -484,7 +766,13 @@ with tab_content:
             )
 
             current_device_used = 1200 * 1024 * 1024  # baseline 1.2 GB
-            if not df_contention.empty and "device_used_bytes" in df_contention.columns:
+            if data_source_mode.startswith("🔴 Live GPU") and gpu_hardware and pynvml:
+                try:
+                    live_mem = pynvml.nvmlDeviceGetMemoryInfo(gpu_hardware["handle"])
+                    current_device_used = int(live_mem.used)
+                except Exception:
+                    pass
+            elif not df_contention.empty and "device_used_bytes" in df_contention.columns:
                 last_used = df_contention["device_used_bytes"].dropna().iloc[-1]
                 if last_used > 0:
                     current_device_used = int(last_used)
