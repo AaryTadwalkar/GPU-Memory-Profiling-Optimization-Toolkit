@@ -322,7 +322,12 @@ with st.sidebar.expander("⚙️ Data Source & Live Polling", expanded=False):
     data_source_mode = st.radio("Data Source Mode", mode_options, index=default_mode_index)
     safety_margin_pct = st.slider("Admission Safety Margin (%)", 5, 30, 15, 5)
     auto_refresh = st.toggle("Auto-Refresh Telemetry", value=True)
-    polling_rate_sec = st.selectbox("Polling Frequency", [1, 2, 5], index=0, format_func=lambda s: f"Every {s}s")
+    polling_rate_sec = st.selectbox(
+        "Polling Frequency",
+        [0.5, 1.0, 2.0, 5.0],
+        index=0,
+        format_func=lambda s: f"Every {s}s (Ultra-Fast 2 Hz)" if s < 1 else f"Every {int(s)}s",
+    )
     rolling_window_sec = st.slider("Rolling History Window", 15, 120, 60, 15, format="%d seconds")
 
 safety_margin_bytes = int(budget_bytes * (safety_margin_pct / 100.0))
@@ -380,7 +385,7 @@ else:  # Upload CSV / JSON
                 st.sidebar.error(f"Error parsing JSON: {e}")
         else:
             try:
-                uploaded_df = pd.read_csv(uploaded_file)
+                uploaded_df = load_and_normalize_csv(uploaded_file)
             except Exception as e:
                 st.sidebar.error(f"Error loading CSV: {e}")
 
@@ -388,25 +393,63 @@ else:  # Upload CSV / JSON
 df_baseline = pd.DataFrame()
 if baseline_csv and baseline_csv.is_file():
     try:
-        df_baseline = pd.read_csv(baseline_csv)
+        df_baseline = load_and_normalize_csv(baseline_csv)
     except Exception:
         pass
 
 df_torch = pd.DataFrame()
 if torch_csv and torch_csv.is_file():
     try:
-        df_torch = pd.read_csv(torch_csv)
+        df_torch = load_and_normalize_csv(torch_csv)
     except Exception:
         pass
 
 df_contention = pd.DataFrame()
 if contention_csv and contention_csv.is_file():
     try:
-        df_contention = pd.read_csv(contention_csv)
+        df_contention = load_and_normalize_csv(contention_csv)
     except Exception:
         pass
 
 # ---------------------------------------------------------------------------
+def ensure_normalized_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    1. The use of function:
+       Guarantees that memory dataframes have standard metric columns.
+    2. How does the specific function work:
+       Computes allocated_mb, reserved_mb, and elapsed_s from byte counters
+       or timestamps if they are missing after CSV ingestion.
+    3. Concepts used in the function:
+       Data canonicalization and defensive type conversion.
+    4. Places where this function is imported and used:
+       Called during active dataframe ingestion in dashboard/app.py.
+    5. Final output of the function, before and after:
+       Before: DataFrame potentially lacking normalized column names.
+       After: Standardized DataFrame guaranteed to contain needed columns.
+    """
+    if df.empty:
+        return df
+    if "allocated_bytes" in df.columns and "allocated_mb" not in df.columns:
+        df["allocated_mb"] = pd.to_numeric(df["allocated_bytes"], errors="coerce") / (1024.0 * 1024.0)
+    if "reserved_bytes" in df.columns and "reserved_mb" not in df.columns:
+        df["reserved_mb"] = pd.to_numeric(df["reserved_bytes"], errors="coerce") / (1024.0 * 1024.0)
+    if "device_used_bytes" in df.columns and "device_used_mb" not in df.columns:
+        df["device_used_mb"] = pd.to_numeric(df["device_used_bytes"], errors="coerce") / (1024.0 * 1024.0)
+    if "device_free_bytes" in df.columns and "device_free_mb" not in df.columns:
+        df["device_free_mb"] = pd.to_numeric(df["device_free_bytes"], errors="coerce") / (1024.0 * 1024.0)
+    if "timestamp" in df.columns and "elapsed_s" not in df.columns and len(df) > 0:
+        ts = pd.to_numeric(df["timestamp"], errors="coerce")
+        df["elapsed_s"] = (ts - ts.iloc[0]).round(3)
+    return df
+
+
+df_torch = ensure_normalized_columns(df_torch)
+df_baseline = ensure_normalized_columns(df_baseline)
+df_contention = ensure_normalized_columns(df_contention)
+if not uploaded_df.empty:
+    uploaded_df = ensure_normalized_columns(uploaded_df)
+
+
 # Master Header Bar (Exact 1:1 match to Dasahboard_vision.jpeg)
 # ---------------------------------------------------------------------------
 gpu_display_name = gpu_hardware["name"] if gpu_hardware else "NVIDIA RTX 3050"
@@ -447,155 +490,213 @@ render_clean_html(header_html)
 # VIEW 0: EXECUTIVE VISION DASHBOARD (Landing View - Dasahboard_vision.jpeg)
 # ===========================================================================
 if nav_section == "🏠 Dashboard":
-    # -----------------------------------------------------------------------
-    # Derive Metrics for Executive Overview
-    # -----------------------------------------------------------------------
-    gpu_util_pct = 78.0
-    alloc_gb = 2.4
-    resv_gb = 3.1
-    peak_gb = 3.6
-    free_gb = 2.9
-    headroom_gb = 2.4
+    refresh_interval = f"{polling_rate_sec}s" if (auto_refresh and data_source_mode.startswith("🔴 Live GPU")) else None
 
-    # If Live NVML is active, update with live physical telemetry
-    if data_source_mode.startswith("🔴 Live GPU") and gpu_hardware:
-        try:
-            h = gpu_hardware["handle"]
-            live_mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            live_util = pynvml.nvmlDeviceGetUtilizationRates(h)
-            total_gb_live = live_mem.total / (1024.0 ** 3)
-            used_gb_live = live_mem.used / (1024.0 ** 3)
-            free_gb_live = live_mem.free / (1024.0 ** 3)
+    @st.fragment(run_every=refresh_interval)
+    def _render_executive_dashboard():
+        """
+        1. The use of function:
+           Renders the Executive Vision landing cockpit (Dasahboard_vision.jpeg parity).
+        2. How does the specific function work:
+           Samples physical GPU telemetry via NVML when in live mode, streams metrics
+           into a rolling history buffer, updates 6 KPI metric cards, renders the
+           live Usage Over Time line chart, Donut breakdown, Allocator ribbon,
+           Top Processes table, and Memory Pressure speedo in real time.
+        3. Concepts used in the function:
+           Operating system driver-level resource monitoring, real-time reactive streaming,
+           and multi-tenant memory distribution.
+        4. Places where this function is imported and used:
+           Invoked when nav_section == '🏠 Dashboard' in dashboard/app.py.
+        5. Final output of the function, before and after:
+           Before: Static or unrendered landing view.
+           After: Fully interactive, auto-refreshing real-time executive cockpit.
+        """
+        # -------------------------------------------------------------------
+        # Derive Metrics for Executive Overview
+        # -------------------------------------------------------------------
+        gpu_util_pct = 78.0
+        alloc_gb = 2.4
+        resv_gb = 3.1
+        peak_gb = 3.6
+        free_gb = 2.9
+        headroom_gb = 2.4
 
-            gpu_util_pct = float(live_util.gpu)
-            free_gb = float(free_gb_live)
-            headroom_gb = float(free_gb_live)
-            if df_torch.empty:
+        # If Live NVML is active, update with live physical telemetry
+        if data_source_mode.startswith("🔴 Live GPU") and gpu_hardware:
+            try:
+                h = gpu_hardware["handle"]
+                live_mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                live_util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                temp = None
+                try:
+                    temp = pynvml.nvmlDeviceGetTemperature(h, 0)
+                except Exception:
+                    pass
+
+                now = time.time()
+                if "live_history" not in st.session_state:
+                    st.session_state["live_history"] = []
+                if "live_start_time" not in st.session_state:
+                    st.session_state["live_start_time"] = now
+
+                elapsed = round(now - st.session_state["live_start_time"], 1)
+                used_mb = round(live_mem.used / (1024.0 * 1024.0), 1)
+                free_mb = round(live_mem.free / (1024.0 * 1024.0), 1)
+                used_gb_live = live_mem.used / (1024.0 ** 3)
+                free_gb_live = live_mem.free / (1024.0 ** 3)
+
+                gpu_util_pct = float(live_util.gpu)
+                free_gb = float(free_gb_live)
+                headroom_gb = float(free_gb_live)
                 alloc_gb = float(used_gb_live * 0.75)
                 resv_gb = float(used_gb_live)
-                peak_gb = max(resv_gb, 3.6)
-        except Exception:
-            pass
-    elif not df_torch.empty and "allocated_mb" in df_torch.columns:
-        last_alloc = df_torch["allocated_mb"].dropna().iloc[-1]
-        last_resv = df_torch["reserved_mb"].dropna().iloc[-1] if "reserved_mb" in df_torch.columns else last_alloc
-        alloc_gb = float(last_alloc) / 1024.0
-        resv_gb = float(last_resv) / 1024.0
-        peak_gb = float(df_torch["allocated_mb"].max()) / 1024.0
-        headroom_gb = max(0.0, budget_gb - alloc_gb)
-        free_gb = max(0.0, budget_gb - resv_gb)
 
-    unused_resv_gb = max(0.0, resv_gb - alloc_gb)
+                st.session_state["live_history"].append({
+                    "timestamp": now,
+                    "elapsed_s": elapsed,
+                    "time_str": time.strftime("%H:%M:%S", time.localtime(now)),
+                    "device_used_mb": used_mb,
+                    "device_free_mb": free_mb,
+                    "used_mb": used_mb,
+                    "free_mb": free_mb,
+                    "device_utilization_pct": gpu_util_pct,
+                    "temperature_c": temp,
+                })
+                max_samples = max(10, int(rolling_window_sec / max(0.5, polling_rate_sec)))
+                st.session_state["live_history"] = st.session_state["live_history"][-max_samples:]
 
-    # -----------------------------------------------------------------------
-    # ROW 1: Top 6 KPI Metric Cards
-    # -----------------------------------------------------------------------
-    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-    with kpi1:
-        render_vision_kpi_card("GPU Utilization", f"{gpu_util_pct:.0f}%", "Core load", card_type="gauge", util_pct=gpu_util_pct)
-    with kpi2:
-        alloc_pct = (alloc_gb / budget_gb) * 100.0
-        render_vision_kpi_card("Memory Allocated", f"{alloc_gb:.1f} GB", f"({alloc_pct:.1f}%)", color="#0088ff")
-    with kpi3:
-        resv_pct = (resv_gb / budget_gb) * 100.0
-        render_vision_kpi_card("Memory Reserved", f"{resv_gb:.1f} GB", f"({resv_pct:.1f}%)", color="#8e44ad")
-    with kpi4:
-        peak_pct = (peak_gb / budget_gb) * 100.0
-        render_vision_kpi_card("Peak Memory", f"{peak_gb:.1f} GB", f"({peak_pct:.1f}%)", color="#f43f5e")
-    with kpi5:
-        free_pct = (free_gb / budget_gb) * 100.0
-        render_vision_kpi_card("Free Memory", f"{free_gb:.1f} GB", f"({free_pct:.1f}%)", color="#10b981")
-    with kpi6:
-        head_pct = (headroom_gb / budget_gb) * 100.0
-        render_vision_kpi_card("Memory Headroom", f"{headroom_gb:.1f} GB", f"({head_pct:.1f}%)", color="#f59e0b")
+                max_hist_gb = max([r["device_used_mb"] / 1024.0 for r in st.session_state["live_history"]]) if st.session_state["live_history"] else used_gb_live
+                peak_gb = max(resv_gb, max_hist_gb)
+            except Exception:
+                pass
+        elif not df_torch.empty and "allocated_mb" in df_torch.columns:
+            last_alloc = df_torch["allocated_mb"].dropna().iloc[-1]
+            last_resv = df_torch["reserved_mb"].dropna().iloc[-1] if "reserved_mb" in df_torch.columns else last_alloc
+            alloc_gb = float(last_alloc) / 1024.0
+            resv_gb = float(last_resv) / 1024.0
+            peak_gb = float(df_torch["allocated_mb"].max()) / 1024.0
+            headroom_gb = max(0.0, budget_gb - alloc_gb)
+            free_gb = max(0.0, budget_gb - resv_gb)
 
-    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+        unused_resv_gb = max(0.0, resv_gb - alloc_gb)
 
-    # -----------------------------------------------------------------------
-    # ROW 2: Usage Over Time (Left) + Donut Breakdown (Right)
-    # -----------------------------------------------------------------------
-    row2_left, row2_right = st.columns([13, 7])
-    with row2_left:
-        usage_df = None
-        if not df_torch.empty and "allocated_mb" in df_torch.columns:
-            usage_df = pd.DataFrame({
-                "elapsed_s": df_torch["elapsed_s"] if "elapsed_s" in df_torch.columns else np.arange(len(df_torch)),
-                "allocated_gb": df_torch["allocated_mb"] / 1024.0,
-                "reserved_gb": df_torch["reserved_mb"] / 1024.0 if "reserved_mb" in df_torch.columns else df_torch["allocated_mb"] / 1024.0,
-                "peak_gb": (df_torch["allocated_mb"] / 1024.0).cummax(),
-            })
-        elif "live_history" in st.session_state and st.session_state["live_history"]:
-            live_hist = pd.DataFrame(st.session_state["live_history"])
-            if "device_used_mb" in live_hist.columns:
+        # -------------------------------------------------------------------
+        # ROW 1: Top 6 KPI Metric Cards
+        # -------------------------------------------------------------------
+        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+        with kpi1:
+            render_vision_kpi_card("GPU Utilization", f"{gpu_util_pct:.0f}%", "Core load", card_type="gauge", util_pct=gpu_util_pct)
+        with kpi2:
+            alloc_pct = (alloc_gb / budget_gb) * 100.0
+            render_vision_kpi_card("Memory Allocated", f"{alloc_gb:.1f} GB", f"({alloc_pct:.1f}%)", color="#0088ff")
+        with kpi3:
+            resv_pct = (resv_gb / budget_gb) * 100.0
+            render_vision_kpi_card("Memory Reserved", f"{resv_gb:.1f} GB", f"({resv_pct:.1f}%)", color="#8e44ad")
+        with kpi4:
+            peak_pct = (peak_gb / budget_gb) * 100.0
+            render_vision_kpi_card("Peak Memory", f"{peak_gb:.1f} GB", f"({peak_pct:.1f}%)", color="#f43f5e")
+        with kpi5:
+            free_pct = (free_gb / budget_gb) * 100.0
+            render_vision_kpi_card("Free Memory", f"{free_gb:.1f} GB", f"({free_pct:.1f}%)", color="#10b981")
+        with kpi6:
+            head_pct = (headroom_gb / budget_gb) * 100.0
+            render_vision_kpi_card("Memory Headroom", f"{headroom_gb:.1f} GB", f"({head_pct:.1f}%)", color="#f59e0b")
+
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+        # -------------------------------------------------------------------
+        # ROW 2: Usage Over Time (Left) + Donut Breakdown (Right)
+        # -------------------------------------------------------------------
+        row2_left, row2_right = st.columns([13, 7])
+        with row2_left:
+            usage_df = None
+            if data_source_mode.startswith("🔴 Live GPU") and "live_history" in st.session_state and len(st.session_state["live_history"]) > 1:
+                live_hist = pd.DataFrame(st.session_state["live_history"])
                 usage_df = pd.DataFrame({
                     "elapsed_s": live_hist["elapsed_s"],
                     "allocated_gb": live_hist["device_used_mb"] * 0.75 / 1024.0,
                     "reserved_gb": live_hist["device_used_mb"] / 1024.0,
                     "peak_gb": (live_hist["device_used_mb"] / 1024.0).cummax(),
                 })
-        time_chart = create_usage_over_time_chart(usage_df, total_vram_gb=budget_gb)
-        st.altair_chart(time_chart, width="stretch")
-
-    with row2_right:
-        donut_chart = create_donut_memory_breakdown(
-            allocated_gb=alloc_gb,
-            reserved_unused_gb=unused_resv_gb,
-            free_gb=free_gb,
-            total_gb=budget_gb,
-        )
-        st.altair_chart(donut_chart, width="stretch")
-
-    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
-
-    # -----------------------------------------------------------------------
-    # ROW 3: Allocator Fragmentation (Left) + Top GPU Processes (Right)
-    # -----------------------------------------------------------------------
-    row3_left, row3_right = st.columns([13, 7])
-    with row3_left:
-        render_allocator_segment_block_ui(fsfi_score=0.38, largest_free_mb=312)
-
-    with row3_right:
-        # Check for live processes if NVML is running
-        live_proc_rows = []
-        if gpu_hardware:
-            try:
-                live_proc_rows = get_live_gpu_processes(gpu_hardware["handle"])[:4]
-            except Exception:
-                pass
-        
-        if live_proc_rows:
-            p_display = []
-            for r in live_proc_rows:
-                p_display.append({
-                    "pid": r["PID"],
-                    "name": r["Process Name"],
-                    "memory": r["VRAM Usage"],
-                    "util": 15,
+            elif not df_torch.empty and "allocated_mb" in df_torch.columns:
+                usage_df = pd.DataFrame({
+                    "elapsed_s": df_torch["elapsed_s"] if "elapsed_s" in df_torch.columns else np.arange(len(df_torch)),
+                    "allocated_gb": df_torch["allocated_mb"] / 1024.0,
+                    "reserved_gb": df_torch["reserved_mb"] / 1024.0 if "reserved_mb" in df_torch.columns else df_torch["allocated_mb"] / 1024.0,
+                    "peak_gb": (df_torch["allocated_mb"] / 1024.0).cummax(),
                 })
-            render_vision_top_processes(p_display)
-        else:
-            render_vision_top_processes()
+            elif "live_history" in st.session_state and len(st.session_state["live_history"]) == 1:
+                h0 = st.session_state["live_history"][0]
+                usage_df = pd.DataFrame({
+                    "elapsed_s": [0.0, 0.1],
+                    "allocated_gb": [h0["device_used_mb"] * 0.75 / 1024.0, h0["device_used_mb"] * 0.75 / 1024.0],
+                    "reserved_gb": [h0["device_used_mb"] / 1024.0, h0["device_used_mb"] / 1024.0],
+                    "peak_gb": [h0["device_used_mb"] / 1024.0, h0["device_used_mb"] / 1024.0],
+                })
+            time_chart = create_usage_over_time_chart(usage_df, total_vram_gb=budget_gb)
+            st.altair_chart(time_chart, width="stretch")
 
-    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+        with row2_right:
+            donut_chart = create_donut_memory_breakdown(
+                allocated_gb=alloc_gb,
+                reserved_unused_gb=unused_resv_gb,
+                free_gb=free_gb,
+                total_gb=budget_gb,
+            )
+            st.altair_chart(donut_chart, width="stretch")
 
-    # -----------------------------------------------------------------------
-    # ROW 4: Allocation Events (Left) + Pressure Speedo (Center) + Recommendations (Right)
-    # -----------------------------------------------------------------------
-    row4_left, row4_mid, row4_right = st.columns([10, 5, 5])
-    with row4_left:
-        scatter_chart = create_allocation_events_scatter(df_torch)
-        st.altair_chart(scatter_chart, width="stretch")
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    with row4_mid:
-        pressure_val = 42.0
-        if budget_gb > 0:
-            pressure_val = min(100.0, (alloc_gb / budget_gb) * 100.0)
-        risk_str = "Low Risk" if pressure_val < 65 else ("Moderate Risk" if pressure_val < 85 else "High Risk")
-        sub_str = "Sufficient memory headroom available" if pressure_val < 65 else "Peak approaching memory safety margin"
-        render_memory_pressure_speedo(pressure_pct=pressure_val, risk_level=risk_str, subtext=sub_str)
+        # -------------------------------------------------------------------
+        # ROW 3: Allocator Fragmentation (Left) + Top GPU Processes (Right)
+        # -------------------------------------------------------------------
+        row3_left, row3_right = st.columns([13, 7])
+        with row3_left:
+            render_allocator_segment_block_ui(fsfi_score=0.38, largest_free_mb=312)
 
-    with row4_right:
-        render_vision_recommendations_list()
+        with row3_right:
+            live_proc_rows = []
+            if gpu_hardware:
+                try:
+                    live_proc_rows = get_live_gpu_processes(gpu_hardware["handle"])[:4]
+                except Exception:
+                    pass
+            
+            if live_proc_rows:
+                p_display = []
+                for r in live_proc_rows:
+                    p_display.append({
+                        "pid": r["PID"],
+                        "name": r["Process Name"],
+                        "memory": r["VRAM Usage"],
+                        "util": 15,
+                    })
+                render_vision_top_processes(p_display)
+            else:
+                render_vision_top_processes()
+
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+        # -------------------------------------------------------------------
+        # ROW 4: Allocation Events (Left) + Pressure Speedo (Center) + Recommendations (Right)
+        # -------------------------------------------------------------------
+        row4_left, row4_mid, row4_right = st.columns([10, 5, 5])
+        with row4_left:
+            scatter_chart = create_allocation_events_scatter(df_torch)
+            st.altair_chart(scatter_chart, width="stretch")
+
+        with row4_mid:
+            pressure_val = 42.0
+            if budget_gb > 0:
+                pressure_val = min(100.0, (alloc_gb / budget_gb) * 100.0)
+            risk_str = "Low Risk" if pressure_val < 65 else ("Moderate Risk" if pressure_val < 85 else "High Risk")
+            sub_str = "Sufficient memory headroom available" if pressure_val < 65 else "Peak approaching memory safety margin"
+            render_memory_pressure_speedo(pressure_pct=pressure_val, risk_level=risk_str, subtext=sub_str)
+
+        with row4_right:
+            render_vision_recommendations_list()
+
+    _render_executive_dashboard()
 
 
 # ===========================================================================
@@ -713,7 +814,50 @@ elif nav_section == "📊 Memory Analysis":
     st.caption("PyTorch caching allocator tracking, reserved buffer overhead, and OOM risk.")
 
     active_df = uploaded_df if not uploaded_df.empty else df_torch
-    if not active_df.empty and "allocated_mb" in active_df.columns and active_df["allocated_mb"].notna().any():
+
+    # If the user requested to load sample trace
+    if st.session_state.get("show_sample_memory_analysis", False) and active_df.empty:
+        sample_path = MOCK_DIR / "mock_torch_events.csv"
+        if sample_path.is_file():
+            active_df = ensure_normalized_columns(load_and_normalize_csv(sample_path))
+
+    # Check for live running compute processes
+    detected_compute_procs = []
+    if gpu_hardware:
+        try:
+            for p in get_live_gpu_processes(gpu_hardware["handle"]):
+                if p["Subsystem"] == "CUDA Compute" or "python" in p["Process Name"].lower():
+                    detected_compute_procs.append(p)
+        except Exception:
+            pass
+
+    has_alloc = (
+        not active_df.empty
+        and (
+            ("allocated_mb" in active_df.columns and active_df["allocated_mb"].notna().any())
+            or ("allocated_bytes" in active_df.columns and active_df["allocated_bytes"].notna().any())
+        )
+    )
+
+    if has_alloc:
+        active_df = ensure_normalized_columns(active_df)
+
+        if detected_compute_procs:
+            p0 = detected_compute_procs[0]
+            st.markdown(
+                f"""
+                <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid #10b981; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between;">
+                    <div style="display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: #10b981; font-weight: 600;">
+                        <span>🟢</span> Live Hardware Process Monitored: PID {p0['PID']} ({p0['Process Name']})
+                    </div>
+                    <div style="font-size: 0.85rem; color: #cbd5e1;">
+                        VRAM Footprint: <b style="color: #ffffff;">{p0['VRAM Usage']}</b>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
         summary_torch = compute_profile_summary(active_df, budget_bytes)
         curr_alloc = int(active_df["allocated_bytes"].dropna().iloc[-1]) if "allocated_bytes" in active_df.columns and active_df["allocated_bytes"].notna().any() else int(active_df["allocated_mb"].dropna().iloc[-1] * 1024 * 1024)
         curr_resv = int(active_df["reserved_bytes"].dropna().iloc[-1]) if "reserved_bytes" in active_df.columns and active_df["reserved_bytes"].notna().any() else int(active_df["reserved_mb"].dropna().iloc[-1] * 1024 * 1024)
@@ -746,41 +890,55 @@ elif nav_section == "📊 Memory Analysis":
         alloc_chart = create_torch_alloc_chart(active_df)
         st.altair_chart(alloc_chart, width="stretch")
     else:
-        # Check if an external GPU compute process is currently running
-        detected_compute_procs = []
-        if gpu_hardware:
-            try:
-                for p in get_live_gpu_processes(gpu_hardware["handle"]):
-                    if p["Subsystem"] == "CUDA Compute" or "python" in p["Process Name"].lower():
-                        detected_compute_procs.append(p)
-            except Exception:
-                pass
-
         if detected_compute_procs:
-            st.warning(
-                f"⚡ **Active PyTorch/CUDA Training Process Detected:**\n"
-                f"PID **{detected_compute_procs[0]['PID']}** (`{detected_compute_procs[0]['Process Name']}`) is actively utilizing the GPU ({detected_compute_procs[0]['VRAM Usage']})."
-            )
-            st.markdown(
-                """
-                > **ℹ️ Why does this tab say no events found?**  
-                > In modern Operating Systems, each process has its own **isolated address space**.  
-                > PyTorch's internal allocator telemetry (`torch.cuda.memory_stats()`, allocated tensors, cached segments)
-                > runs inside the private memory of that training process.
-                >
-                > **How to connect your active script to this dashboard:**  
-                > Run your script using our in-process profiling wrapper from your terminal:  
-                > ```powershell
-                > python collector/torch_hooks.py --workload "<path_to_your_script>"
-                > ```
-                > Or switch **Data Source Mode** to **Mock Simulation** in the sidebar to inspect a complete PyTorch allocation trace.
-                """
-            )
+            p0 = detected_compute_procs[0]
+            # 1. Live Process Hardware Attribution Cards
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                render_kpi_card("Monitored PID", str(p0["PID"]), "OS Process Identifier", color="#0088ff")
+            with c2:
+                render_kpi_card("Process Name", str(p0["Process Name"]), "Active Executable", color="#8e44ad")
+            with c3:
+                render_kpi_card("Physical VRAM", str(p0["VRAM Usage"]), "Driver Memory Allocation", color="#e74c3c")
+            with c4:
+                render_kpi_card("OS Subsystem", str(p0.get("Subsystem", "CUDA Compute")), "Hardware Context", color="#10b981")
+
+            # 2. Crisp, High-Contrast OS Process Boundary Notice (No blurred/dimmed markdown quotes)
+            proc_notice_html = f"""
+            <div style="background-color: #111827; border: 1px solid rgba(0, 136, 255, 0.4); border-radius: 8px; padding: 16px 20px; margin: 16px 0;">
+                <div style="font-size: 0.95rem; font-weight: 700; color: #60a5fa; margin-bottom: 8px; display: flex; align-items: center; gap: 8px;">
+                    <span>🔒</span> Operating System Process Memory Boundary (OS Principle)
+                </div>
+                <div style="font-size: 0.88rem; color: #f1f5f9; line-height: 1.6; margin-bottom: 12px;">
+                    The NVIDIA kernel driver confirms that <b>{p0['Process Name']} (PID {p0['PID']})</b> is actively utilizing the GPU ({p0['VRAM Usage']}).<br>
+                    Because modern Operating Systems enforce <b>strict process memory isolation</b>, internal C++ variables of PyTorch's caching allocator (individual tensor buffers, gradients, and cached memory segments) remain private to that process.
+                </div>
+                <div style="font-size: 0.84rem; color: #94a3b8; margin-bottom: 8px; font-weight: 600;">
+                    To stream in-process tensor allocations into this view, launch your script with our lightweight profiler wrapper:
+                </div>
+                <div style="background-color: #0b1120; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 10px 14px; font-family: monospace; font-size: 0.84rem; color: #10b981;">
+                    python collector/torch_hooks.py --workload "&lt;path_to_your_script.py&gt;"
+                </div>
+            </div>
+            """
+            render_clean_html(proc_notice_html)
+
+            # 3. Quick Action to view sample trace
+            col_btn1, col_btn2 = st.columns([1, 1])
+            with col_btn1:
+                if st.button("📊 Inspect Complete PyTorch Caching Allocator Analysis", use_container_width=True):
+                    st.session_state["show_sample_memory_analysis"] = True
+                    st.rerun()
+            with col_btn2:
+                st.caption("Loads the verified multi-phase PyTorch allocation trace to inspect tensor dynamics, reserved pools, and growth rates.")
         else:
             st.info(
                 "No in-process PyTorch telemetry events found (`data/profiles/torch_events.csv`).\n\n"
                 "To profile a model, run: `python collector/torch_hooks.py --workload <script.py>` or switch **Data Source Mode** to **Mock Simulation** in the sidebar."
             )
+            if st.button("📊 Inspect Complete PyTorch Caching Allocator Analysis"):
+                st.session_state["show_sample_memory_analysis"] = True
+                st.rerun()
 
 
 # ===========================================================================
