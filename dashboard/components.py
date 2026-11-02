@@ -33,6 +33,7 @@ File: dashboard/components.py
      * render_hit_ratio_comparison_chart (Altair bar charts comparing FIFO, LRU, Optimal).
      * render_tiered_memory_dual_gauge (VRAM utilization vs CPU pinned swap overflow gauge).
      * render_tiered_timeline_chart (Altair comparative timeline: baseline vs capped VRAM + CPU spill).
+     * render_live_benchmark_chart (Altair real-time streaming chart for 60s live benchmark).
      * render_paged_kv_block_diagram (physical VRAM block grid and Copy-On-Write sharing map).
      * render_kv_waste_comparison_chart (side-by-side contiguous vs paged waste comparison).
 
@@ -1818,4 +1819,112 @@ def render_tiered_timeline_chart(
         .configure(background="#111827")
     )
     st.altair_chart(chart, width="stretch")
+
+
+def render_live_benchmark_chart(
+    records_df: pd.DataFrame,
+    vram_budget_mb: float = 6140.0,
+    threshold_mb: float = 4900.0,
+) -> None:
+    """
+    1. The use of function:
+       Renders an interactive streaming Altair time-series chart visualizing real-time primary
+       GPU VRAM allocation vs host CPU pinned RAM spill over the 60-second live benchmark execution.
+
+    2. How does the specific function work:
+       Takes a DataFrame containing benchmark step records (columns: elapsed_s, vram_used_mb,
+       host_ram_used_mb, status, phase_name). Melts VRAM and Host RAM metrics into normalized
+       series rows. Plots dynamic multi-colored line curves with point overlays, renders horizontal
+       dashed rules for hardware capacity and offload threshold, and renders directly into
+       Streamlit with dark-mode styling.
+
+    3. Concepts used in the function:
+       Real-time time-series streaming visualization, Altair chart layering (lines, points, rules),
+       tiered memory hierarchy telemetry, and dynamic memory safety thresholding.
+
+    4. Places where this function is imported and used:
+       Imported by dashboard/app.py in the OOM Defense laboratory view during live benchmark runs.
+
+    5. Final output of the function, before and after:
+       Before: Raw time-series DataFrame of benchmark records.
+       After: Rendered Altair streaming chart displayed in the web dashboard.
+    """
+    if records_df is None or records_df.empty:
+        st.info("No benchmark time-series data available to plot.")
+        return
+
+    # Prepare series data for plotting
+    plot_rows = []
+    for _, row in records_df.iterrows():
+        t = float(row.get("elapsed_s", 0.0))
+        vram = float(row.get("vram_used_mb", 0.0))
+        host = float(row.get("host_ram_used_mb", 0.0))
+        phase = str(row.get("phase_name", "Training"))
+        status = str(row.get("status", "RUNNING"))
+
+        plot_rows.append({
+            "Time (s)": t,
+            "Series": "Primary GPU VRAM",
+            "Memory (MB)": round(vram, 1),
+            "Phase": phase,
+            "Status": status,
+        })
+        plot_rows.append({
+            "Time (s)": t,
+            "Series": "Host CPU Pinned RAM (Spill)",
+            "Memory (MB)": round(host, 1),
+            "Phase": phase,
+            "Status": status,
+        })
+
+    df_plot = pd.DataFrame(plot_rows)
+
+    color_scale = alt.Scale(
+        domain=["Primary GPU VRAM", "Host CPU Pinned RAM (Spill)"],
+        range=["#00d2ff", "#c084fc"],
+    )
+
+    base = alt.Chart(df_plot).encode(
+        x=alt.X("Time (s):Q", title="Elapsed Time (seconds)", axis=alt.Axis(labelColor="#e2e8f0", titleColor="#94a3b8")),
+        y=alt.Y("Memory (MB):Q", title="Allocated Memory (MB)", axis=alt.Axis(labelColor="#e2e8f0", titleColor="#94a3b8")),
+        color=alt.Color("Series:N", scale=color_scale, legend=alt.Legend(title=None, orient="top", labelColor="#e2e8f0")),
+        tooltip=[
+            alt.Tooltip("Time (s):Q", format=".1f"),
+            alt.Tooltip("Series:N"),
+            alt.Tooltip("Memory (MB):Q", format=".1f"),
+            alt.Tooltip("Phase:N"),
+            alt.Tooltip("Status:N"),
+        ],
+    )
+
+    lines = base.mark_line(strokeWidth=2.5)
+    points = base.mark_point(size=30, filled=True)
+
+    # Threshold horizontal rule
+    thresh_df = pd.DataFrame([{"Threshold": threshold_mb}])
+    thresh_rule = alt.Chart(thresh_df).mark_rule(
+        strokeDash=[5, 5], color="#f59e0b", strokeWidth=1.8
+    ).encode(
+        y="Threshold:Q",
+        tooltip=[alt.Tooltip("Threshold:Q", title="Offload Threshold (MB)", format=".1f")],
+    )
+
+    # Budget horizontal rule
+    budget_df = pd.DataFrame([{"Budget": vram_budget_mb}])
+    budget_rule = alt.Chart(budget_df).mark_rule(
+        strokeDash=[3, 3], color="#f43f5e", strokeWidth=1.5
+    ).encode(
+        y="Budget:Q",
+        tooltip=[alt.Tooltip("Budget:Q", title="Hardware VRAM Capacity (MB)", format=".1f")],
+    )
+
+    chart = (
+        alt.layer(lines, points, thresh_rule, budget_rule)
+        .properties(height=280)
+        .configure_view(strokeWidth=0)
+        .configure(background="#111827")
+    )
+
+    st.altair_chart(chart, width="stretch")
+
 

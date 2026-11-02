@@ -385,12 +385,18 @@ class TieredActivationManager:
 
         start_time = time.perf_counter()
         if tensor.device.type == "cuda":
-            stored_tensor = tensor.detach().to("cpu", non_blocking=True)
-            if self.use_pinned_memory and torch.cuda.is_available() and not stored_tensor.is_pinned():
-                try:
-                    stored_tensor = stored_tensor.pin_memory()
-                except Exception:
-                    pass
+            try:
+                if self.use_pinned_memory:
+                    stored_tensor = tensor.detach().to("cpu", non_blocking=True)
+                    if torch.cuda.is_available() and not stored_tensor.is_pinned():
+                        try:
+                            stored_tensor = stored_tensor.pin_memory()
+                        except Exception:
+                            pass
+                else:
+                    stored_tensor = tensor.detach().cpu()
+            except Exception:
+                stored_tensor = tensor.detach().cpu()
         else:
             # CPU simulation mode
             stored_tensor = tensor.detach().clone()

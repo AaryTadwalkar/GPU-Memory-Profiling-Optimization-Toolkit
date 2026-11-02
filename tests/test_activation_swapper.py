@@ -20,6 +20,7 @@ File: tests/test_activation_swapper.py
    - TestContextManagerLifecycle: Validates proper hook activation and unregistration.
    - TestEventChronology: Validates paired OFFLOAD and PREFETCH event pairs and ordering.
    - TestDirectHooksAndReset: Validates manual hook invocations and state resetting.
+   - TestLive1MinBenchmark: Validates the multi-phase streaming 60s benchmark engine and OOM defense.
 
 4. Final output of the file:
    Pytest test suite producing verifiable pass/fail assertions for all activation swapper features.
@@ -47,7 +48,12 @@ from optimizer.activation_swapper import (
     ActivationSwapSummary,
     TieredActivationManager,
 )
-from workloads.activation_swap_demo import SyntheticMLP
+from workloads.activation_swap_demo import (
+    SyntheticMLP,
+    BenchmarkStepRecord,
+    LiveBenchmarkSummary,
+    run_live_1min_benchmark,
+)
 
 
 class TestGradientEquivalence:
@@ -557,3 +563,151 @@ class TestDirectHooksAndReset:
         assert torch.equal(tensor, restored)
         assert manager.total_bytes_prefetched == 0
         assert len([e for e in manager.events if e.event_type == "PREFETCH"]) == 0
+
+
+class TestLive1MinBenchmark:
+    """
+    1. The use of class:
+       Tests the real-time live training benchmark orchestration engine (`run_live_1min_benchmark`),
+       telemetry recording (`BenchmarkStepRecord`), and aggregate reporting (`LiveBenchmarkSummary`).
+
+    2. What the class contain:
+       Test methods verifying two-phase execution, dynamic OOM crash detection, batch scaling,
+       mathematical gradient equivalence, and time-series serialization.
+
+    3. Technologies used and why:
+       PyTorch autograd, pytest assertions, and CPU simulation for safe, deterministic testing.
+
+    4. Key design and overall design of the class:
+       Validates that Phase 1 appropriately stresses memory capacity and captures crashes,
+       Phase 2 engages TieredActivationManager to ensure zero crashes at 2x batch throughput,
+       and all telemetry records conform to streaming UI schemas.
+    """
+
+    def test_run_live_benchmark_execution(self) -> None:
+        """
+        1. The use of function:
+           Tests normal multi-phase execution of the live training benchmark without forced crash.
+
+        2. How does the specific function work:
+           Invokes `run_live_1min_benchmark` with short phase durations and safe threshold,
+           collects callback ticks, and verifies records, batch sizes, and gradient equivalence.
+
+        3. Concepts used in the function:
+           Multi-phase training execution, time-series callback recording, gradient verification.
+
+        4. Places where this function is imported and used:
+           Executed by pytest test runner.
+
+        5. Final output of the function, before and after:
+           Before: Unexecuted benchmark.
+           After: Populated LiveBenchmarkSummary with verified mathematical gradient match.
+        """
+        collected_records = []
+
+        summary = run_live_1min_benchmark(
+            device_name="cpu",
+            simulate=True,
+            phase1_duration_s=1.2,
+            phase2_duration_s=1.2,
+            batch_p1=16,
+            batch_p2=32,
+            model_type="mlp",
+            vram_budget_mb=6140.0,
+            offload_threshold_mb=4900.0,
+            simulate_oom_on_baseline=False,
+            step_interval_s=0.3,
+            callback=lambda r: collected_records.append(r),
+        )
+
+        assert isinstance(summary, LiveBenchmarkSummary)
+        assert summary.total_duration_s > 0.0
+        assert len(collected_records) >= 2
+        assert summary.batch_speedup_ratio == 2.0
+        assert summary.gradient_equivalence is True
+        assert summary.max_gradient_diff == 0.0
+
+        p1_records = [r for r in collected_records if r.phase_id == 1]
+        p2_records = [r for r in collected_records if r.phase_id == 2]
+        assert len(p1_records) >= 1
+        assert len(p2_records) >= 1
+        assert p1_records[0].batch_size == 16
+        assert p2_records[0].batch_size == 32
+
+    def test_run_live_benchmark_oom_crash(self) -> None:
+        """
+        1. The use of function:
+           Tests that the live benchmark engine accurately detects and handles an OOM abort in Phase 1,
+           gracefully halts baseline training, and proceeds to Phase 2 with TieredActivationManager.
+
+        2. How does the specific function work:
+           Configures `simulate_oom_on_baseline=True` with short duration and fast ramp,
+           asserts that Phase 1 records an OOM abort, and confirms Phase 2 completes stably.
+
+        3. Concepts used in the function:
+           OOM abort interception, fault recovery, tiered memory protection.
+
+        4. Places where this function is imported and used:
+           Executed by pytest test runner.
+
+        5. Final output of the function, before and after:
+           Before: Unexecuted benchmark.
+           After: Verified crash detection in Phase 1 and successful recovery in Phase 2.
+        """
+        summary = run_live_1min_benchmark(
+            device_name="cpu",
+            simulate=True,
+            phase1_duration_s=2.5,
+            phase2_duration_s=1.2,
+            batch_p1=32,
+            batch_p2=64,
+            model_type="resnet",
+            vram_budget_mb=4096.0,
+            offload_threshold_mb=3200.0,
+            simulate_oom_on_baseline=True,
+            step_interval_s=0.3,
+        )
+
+        assert summary.phase1_crashed_oom is True
+        assert summary.phase2_duration_s > 0.0
+        assert summary.batch_speedup_ratio == 2.0
+        assert summary.gradient_equivalence is True
+
+    def test_benchmark_step_record_to_dict(self) -> None:
+        """
+        1. The use of function:
+           Tests serialization of BenchmarkStepRecord into a standard dictionary.
+
+        2. How does the specific function work:
+           Instantiates BenchmarkStepRecord, calls `to_dict()`, and verifies all dictionary keys.
+
+        3. Concepts used in the function:
+           Dataclass serialization and schema conformity.
+
+        4. Places where this function is imported and used:
+           Executed by pytest test runner.
+
+        5. Final output of the function, before and after:
+           Before: Typed dataclass.
+           After: Verified dictionary representation.
+        """
+        rec = BenchmarkStepRecord(
+            timestamp=1000.0,
+            elapsed_s=12.5,
+            phase_id=1,
+            phase_name="Phase 1: Baseline",
+            step=5,
+            batch_size=32,
+            vram_used_mb=5400.0,
+            host_ram_used_mb=0.0,
+            status="RUNNING",
+            tensors_swapped=0,
+            bytes_swapped=0,
+            gradient_matched=True,
+        )
+        d = rec.to_dict()
+        assert d["elapsed_s"] == 12.5
+        assert d["batch_size"] == 32
+        assert d["vram_used_mb"] == 5400.0
+        assert d["status"] == "RUNNING"
+

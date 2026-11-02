@@ -44,6 +44,7 @@ from dashboard.components import (
     render_hit_ratio_comparison_chart,
     render_tiered_memory_dual_gauge,
     render_tiered_timeline_chart,
+    render_live_benchmark_chart,
     render_paged_kv_block_diagram,
     render_kv_waste_comparison_chart,
 )
@@ -476,3 +477,77 @@ class TestTieredTimelineChart:
         assert mock_altair.called
         chart_arg = mock_altair.call_args[0][0]
         assert chart_arg is not None
+
+
+class TestLiveBenchmarkChart:
+    """
+    1. The use of class:
+       Tests the render_live_benchmark_chart presentation component visualizing real-time
+       primary GPU VRAM allocation vs host CPU pinned RAM spill over benchmark execution.
+
+    2. What the class contain:
+       Test methods verifying empty DataFrame handling and populated time-series rendering.
+
+    3. Technologies used and why:
+       pytest, pandas, and unittest.mock.patch to safely mock streamlit DOM and charting operations.
+
+    4. Key design and overall design of the class:
+       Asserts that the component renders without exceptions, layers time-series lines, points,
+       and horizontal threshold markers, and invokes st.altair_chart with width="stretch".
+    """
+
+    @patch("dashboard.components.st.info")
+    def test_render_empty_live_benchmark_chart(self, mock_info: MagicMock) -> None:
+        """
+        1. The use of function:
+           Tests that render_live_benchmark_chart displays informational notice when passed an empty DataFrame.
+
+        2. How does the specific function work:
+           Invokes render_live_benchmark_chart with an empty DataFrame and asserts st.info was called.
+
+        3. Concepts used in the function:
+           Graceful UI degradation on empty telemetry streams.
+
+        4. Places where this function is imported and used:
+           Executed by pytest test runner.
+
+        5. Final output of the function, before and after:
+           Before: Empty DataFrame.
+           After: Verified call to st.info.
+        """
+        import pandas as pd
+        render_live_benchmark_chart(pd.DataFrame())
+        assert mock_info.called
+
+    @patch("dashboard.components.st.altair_chart")
+    def test_render_populated_live_benchmark_chart(self, mock_altair: MagicMock) -> None:
+        """
+        1. The use of function:
+           Tests that render_live_benchmark_chart constructs and renders an Altair layered chart for valid telemetry.
+
+        2. How does the specific function work:
+           Constructs a multi-row benchmark DataFrame, invokes render_live_benchmark_chart,
+           and asserts st.altair_chart was called with width="stretch".
+
+        3. Concepts used in the function:
+           Time-series chart generation, Altair layering, and UI presentation testing.
+
+        4. Places where this function is imported and used:
+           Executed by pytest test runner.
+
+        5. Final output of the function, before and after:
+           Before: Populated DataFrame with elapsed time, VRAM, and Host RAM columns.
+           After: Verified invocation of st.altair_chart.
+        """
+        import pandas as pd
+        df = pd.DataFrame([
+            {"elapsed_s": 0.0, "vram_used_mb": 2400.0, "host_ram_used_mb": 0.0, "phase_name": "Phase 1", "status": "RUNNING"},
+            {"elapsed_s": 10.0, "vram_used_mb": 5200.0, "host_ram_used_mb": 0.0, "phase_name": "Phase 1", "status": "PRESSURE"},
+            {"elapsed_s": 25.0, "vram_used_mb": 4800.0, "host_ram_used_mb": 3400.0, "phase_name": "Phase 2", "status": "PROTECTED"},
+        ])
+        render_live_benchmark_chart(df, vram_budget_mb=6140.0, threshold_mb=4900.0)
+        assert mock_altair.called
+        chart_arg = mock_altair.call_args[0][0]
+        assert chart_arg is not None
+        assert mock_altair.call_args[1].get("width") == "stretch"
+
