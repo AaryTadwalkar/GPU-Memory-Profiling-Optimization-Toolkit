@@ -6,8 +6,7 @@ File: dashboard/app.py
    Optimization Toolkit. Features an Executive Vision landing dashboard matching
    Dasahboard_vision.jpeg, vertical left-sidebar navigation, real-time physical GPU
    telemetry (1 Hz NVML), in-process allocator dynamics, Free-Space Fragmentation
-   Index (FSFI), multi-process contention, cooperative admission control, rule-based
-   optimization recommendations, and experimental benchmark results.
+   Index (FSFI), multi-process contention, cooperative admission control, OS virtual memory simulation, and experimental benchmark results.
 
 2. Overall design:
    A modular application with a dual-layer interface:
@@ -18,7 +17,7 @@ File: dashboard/app.py
      Gauge, and Priority Optimization Cards.
    - Layer 2 (Section Deep Dives): Deep-dive section pages accessible via the left sidebar
      for live telemetry traces, detailed allocator memory pools, snapshot segment trees,
-     admission control simulators, linear batch optimizers, and OS concept matrices.
+     admission control simulators, OS virtual memory lab, and OOM Defense demos.
 
 3. Elements in the file:
    - Sidebar: Vertical navigation menu, Model/Batch settings, Hardware configuration,
@@ -29,9 +28,7 @@ File: dashboard/app.py
    - Section 3: Fragmentation (Allocator FSFI & Segment Block Explorer).
    - Section 4: Multi-Process View (Contention & Cooperative Admission Control).
    - Section 5: OOM Defense & Tiered Swapper (Dynamic saved tensor interception & DMA host spillover).
-   - Section 6: Generative AI Paged KV-Cache (vLLM PagedAttention, block tables, and Copy-On-Write forking).
-   - Section 7: Optimization Recommendations (Traceable Rules & Interactive Batch Sizing).
-   - Section 8: Experiment Runner (Benchmark Matrix).
+   - Section 6: Experiment Runner (Benchmark Matrix).
 
 4. Final output of the file:
    An interactive, production-grade web dashboard running at http://localhost:8501.
@@ -81,8 +78,6 @@ from pipeline.aggregate import (
 from pipeline.validate import validate_csv_file
 from profiler.memory_pressure import evaluate_oom_risk_heuristic
 from profiler.fragmentation import parse_snapshot_json
-from optimizer.batch_optimizer import BatchOptimizer
-from optimizer.recommendations import RecommendationEngine
 from controller.admission_control import AdmissionController, AdmissionDecision
 from controller.virtual_memory import (
     VirtualMemoryManager,
@@ -101,13 +96,6 @@ from workloads.activation_swap_demo import (
     BenchmarkStepRecord,
     LiveBenchmarkSummary,
     RealConvNetStage,
-)
-from optimizer.paged_cache import (
-    PagedKVCacheManager,
-    WasteComparisonMetrics,
-    PhysicalBlock,
-    SequenceDescriptor,
-    BlockTable,
 )
 from dashboard.components import (
     apply_custom_css,
@@ -136,8 +124,6 @@ from dashboard.components import (
     render_tiered_memory_dual_gauge,
     render_tiered_timeline_chart,
     render_live_benchmark_chart,
-    render_paged_kv_block_diagram,
-    render_kv_waste_comparison_chart,
 )
 
 
@@ -297,8 +283,6 @@ nav_section = st.sidebar.radio(
         "⊞ Fragmentation",
         "👥 Multi-Process View",
         "⚡ OOM Defense & Tiered Swapper",
-        "🗂️ Generative AI Paged KV-Cache",
-        "🔧 Optimization Recommendations",
         "📋 Experiment Runner",
     ],
     index=0,
@@ -382,21 +366,18 @@ if data_source_mode.startswith("🔴 Live GPU"):
     baseline_csv = None
     torch_csv = PROFILES_DIR / "torch_events.csv" if (PROFILES_DIR / "torch_events.csv").is_file() else None
     contention_csv = None
-    recs_json = PROFILES_DIR / "recs.json" if (PROFILES_DIR / "recs.json").is_file() else None
     snapshot_dir = PROFILES_DIR / "snapshots"
     benchmarks_csv = PROFILES_DIR / "benchmark_results.csv" if (PROFILES_DIR / "benchmark_results.csv").is_file() else None
 elif data_source_mode == "Recorded Profiles (data/profiles/)":
     baseline_csv = PROFILES_DIR / "baseline.csv"
     torch_csv = PROFILES_DIR / "torch_events.csv"
     contention_csv = PROFILES_DIR / "contention.csv"
-    recs_json = PROFILES_DIR / "recs.json"
     snapshot_dir = PROFILES_DIR / "snapshots"
     benchmarks_csv = PROFILES_DIR / "benchmark_results.csv"
 elif data_source_mode == "Mock Simulation (data/mock/)":
     baseline_csv = MOCK_DIR / "mock_baseline.csv"
     torch_csv = MOCK_DIR / "mock_torch_events.csv"
     contention_csv = MOCK_DIR / "mock_contention.csv"
-    recs_json = MOCK_DIR / "mock_recs.json"
     snapshot_dir = MOCK_DIR / "snapshots"
     benchmarks_csv = MOCK_DIR / "mock_benchmark_results.csv"
 else:  # Upload CSV / JSON
@@ -407,7 +388,6 @@ else:  # Upload CSV / JSON
     baseline_csv = None
     torch_csv = None
     contention_csv = None
-    recs_json = None
     snapshot_dir = PROFILES_DIR / "snapshots"
     benchmarks_csv = None
 
@@ -805,191 +785,9 @@ def render_oom_defense_swapper_view():
             st.dataframe(pd.DataFrame(list(tensor_map.values())[:25]), width="stretch")
 
 
-# ===========================================================================
-# VIEW 5.2: GENERATIVE AI PAGED KV-CACHE (vLLM OSDI '23)
-# ===========================================================================
 
 
-def render_paged_kv_cache_view():
-    """
-    1. The use of function:
-       Renders the dedicated Generative AI Paged KV-Cache Laboratory view (vLLM / PagedAttention OSDI '23).
 
-    2. How does the specific function work:
-       Provides prompt selection/input, tokenization, step-by-step token generation, and Copy-On-Write (COW)
-       sequence branching. Connects directly to `PagedKVCacheManager`, updates physical block allocations,
-       maintains `BlockTable` translations, and renders the physical block pool grid, sequence mapping chains,
-       and contiguous vs paged memory waste comparisons.
-
-    3. Concepts used in the function:
-       PagedAttention, vLLM virtual paging, block tables, Copy-On-Write (COW) memory sharing,
-       internal and external memory fragmentation elimination, and autoregressive decoding memory waste.
-
-    4. Places where this function is imported and used:
-       Invoked when nav_section == "🗂️ Generative AI Paged KV-Cache" in dashboard/app.py.
-
-    5. Final output of the function, before and after:
-       Before: Unrendered view.
-       After: Interactive generative AI memory management console with COW branching and waste analytics.
-    """
-    st.subheader("🗂️ Generative AI Paged KV-Cache (vLLM OSDI '23)")
-    st.caption("Operating system virtual memory page tables applied to autoregressive LLM decoding, eliminating 70-85% internal/external fragmentation.")
-
-    paged_info_html = """
-    <div style="background: rgba(0, 210, 255, 0.08); border-left: 4px solid #00d2ff; padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; font-size: 0.85rem; color: #cbd5e1;">
-        <strong>Generative AI Virtual Token Memory (vLLM OSDI '23):</strong>
-        Autoregressive LLM decoding generates tokens one by one. Traditional systems statically pre-allocate
-        contiguous memory for the maximum sequence length (e.g. 2048 tokens), wasting <strong>70% to 85%</strong>
-        of GPU VRAM in internal/external fragmentation.
-        <strong>PagedAttention</strong> divides the KV-cache into fixed-size physical blocks (e.g. 16 tokens).
-        Logical sequence blocks translate dynamically to physical VRAM frames via <code>BlockTable</code>.
-        Identical prompt prefixes share physical blocks via reference counting (<code>ref_count > 1</code>);
-        when a generation sequence diverges, <strong>Copy-On-Write (COW)</strong> automatically allocates a private frame.
-    </div>
-    """
-    render_clean_html(paged_info_html)
-
-    # Initialize manager in session state
-    if "paged_kv_mgr" not in st.session_state:
-        p_mgr = PagedKVCacheManager(total_physical_blocks=32, block_size_tokens=16, bytes_per_token=128)
-        st.session_state["paged_kv_mgr"] = p_mgr
-        st.session_state["paged_active_seq"] = "seq-primary-query"
-        st.session_state["paged_forked"] = False
-    else:
-        p_mgr = st.session_state["paged_kv_mgr"]
-
-    preset_prompts = {
-        "Operating System Virtual Memory & Paging": "Explain how operating system virtual memory paging prevents GPU fragmentation",
-        "Multi-Turn LLM Reasoning Assistant": "You are an intelligent OS assistant. Explain copy-on-write sequence forking.",
-        "Code Generation & Kernel Programming": "Write a high-performance PyTorch CUDA kernel for flash attention with paged blocks.",
-        "Custom User Prompt": "",
-    }
-
-    col_preset, col_tokens = st.columns([3, 1])
-    with col_preset:
-        chosen_preset = st.selectbox("Prompt Preset", list(preset_prompts.keys()), index=0)
-    with col_tokens:
-        max_gen_tokens = st.slider("Max Tokens to Generate", min_value=4, max_value=64, value=16, step=4)
-
-    default_prompt_text = (
-        preset_prompts[chosen_preset]
-        if chosen_preset != "Custom User Prompt"
-        else "Explain how operating system virtual memory paging prevents GPU fragmentation"
-    )
-    prompt_input = st.text_area("Interactive Prompt Input Box", value=default_prompt_text, height=70)
-
-    # Ensure baseline sequence on initial visit
-    if not p_mgr.sequences:
-        words = prompt_input.strip().split()
-        init_tokens = [abs(hash(w)) % 10000 + 100 for w in words][:24]
-        if not init_tokens:
-            init_tokens = list(range(100, 124))
-        p_mgr.create_sequence("seq-primary-query", init_tokens)
-        p_mgr.fork_sequence("seq-primary-query", "seq-primary-query-cow-branch")
-        p_mgr.append_token("seq-primary-query-cow-branch", 999)
-        st.session_state["paged_active_seq"] = "seq-primary-query"
-        st.session_state["paged_forked"] = True
-        st.session_state["paged_fork_id"] = "seq-primary-query-cow-branch"
-
-    # Action buttons
-    if st.session_state.get("paged_mem_error"):
-        st.warning(
-            f"🚨 **Physical Memory Saturation:** {st.session_state['paged_mem_error']}\n\n"
-            "In OS and vLLM runtimes, when all physical frames are exhausted, the scheduler engages **Sequence Preemption** "
-            "(evicting lower-priority sequences to host CPU swap) or queues new generation requests. Click **'🔄 Reset Cache Pool'** to reclaim memory frames."
-        )
-
-    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
-    with col_btn1:
-        if st.button("▶ Generate Tokens", type="primary", key="btn_paged_gen"):
-            st.session_state["paged_mem_error"] = None
-            words = prompt_input.strip().split()
-            tokens = [abs(hash(w)) % 10000 + 100 for w in words]
-            if not tokens:
-                tokens = list(range(100, 116))
-            act_id = st.session_state.get("paged_active_seq", "seq-primary-query")
-            try:
-                if act_id not in p_mgr.sequences:
-                    p_mgr.create_sequence(act_id, tokens)
-                for _ in range(max_gen_tokens):
-                    p_mgr.append_token(act_id, int(np.random.randint(200, 900)))
-                st.rerun()
-            except MemoryError as e:
-                st.session_state["paged_mem_error"] = str(e)
-                st.rerun()
-
-    with col_btn2:
-        if st.button("🔀 Branch / Fork Query (Test Copy-On-Write)", key="btn_paged_fork"):
-            st.session_state["paged_mem_error"] = None
-            act_id = st.session_state.get("paged_active_seq", "seq-primary-query")
-            if act_id in p_mgr.sequences:
-                fork_id = f"{act_id}-fork-{len(p_mgr.sequences)}"
-                if fork_id not in p_mgr.sequences:
-                    try:
-                        p_mgr.fork_sequence(act_id, fork_id)
-                        st.session_state["paged_forked"] = True
-                        st.session_state["paged_fork_id"] = fork_id
-                        st.rerun()
-                    except MemoryError as e:
-                        st.session_state["paged_mem_error"] = str(e)
-                        st.rerun()
-                    except Exception as e:
-                        st.warning(str(e))
-
-    with col_btn3:
-        if st.button("⚡ Append Token to Diverging Branch", key="btn_paged_diverge"):
-            st.session_state["paged_mem_error"] = None
-            fork_id = st.session_state.get("paged_fork_id", "seq-primary-query-cow-branch")
-            if fork_id in p_mgr.sequences:
-                try:
-                    p_mgr.append_token(fork_id, int(np.random.randint(500, 999)))
-                    st.rerun()
-                except MemoryError as e:
-                    st.session_state["paged_mem_error"] = str(e)
-                    st.rerun()
-                except Exception as e:
-                    st.warning(str(e))
-            else:
-                st.caption("No forked branch active.")
-
-    with col_btn4:
-        if st.button("🔄 Reset Cache Pool", key="btn_paged_reset"):
-            p_mgr.reset()
-            st.session_state["paged_forked"] = False
-            st.session_state["paged_mem_error"] = None
-            st.rerun()
-
-    # Executive badge
-    cow_blocks = sum(1 for b in p_mgr.physical_blocks.values() if b.ref_count > 1)
-    cow_badge_html = f"""
-    <div style="background: rgba(0, 210, 255, 0.08); border: 1px solid #00d2ff; border-radius: 8px; padding: 14px 18px; margin: 16px 0; display: flex; justify-content: space-between; align-items: center;">
-        <div>
-            <div style="font-size: 1.05rem; font-weight: 800; color: #00d2ff; display: flex; align-items: center; gap: 8px;">
-                <span>🔀</span> <span>Copy-On-Write (COW) Virtual Paging Verified</span>
-            </div>
-            <div style="font-size: 0.8rem; color: #cbd5e1; margin-top: 4px;">
-                Shared prompt prefixes reference identical physical VRAM blocks (<code>ref_count &gt; 1</code>), consuming <strong>0 bytes additional memory</strong>.
-                Physical allocation is deferred until a diverging token write triggers page duplication.
-            </div>
-        </div>
-        <div style="text-align: right;">
-            <span style="background: #00d2ff; color: #0b101b; font-weight: 800; font-size: 0.78rem; padding: 5px 12px; border-radius: 4px;">COW ACTIVE ({cow_blocks} SHARED BLOCKS)</span>
-            <div style="font-size: 0.75rem; color: #94a3b8; font-family: monospace; margin-top: 4px;">0 KB Redundant Spill</div>
-        </div>
-    </div>
-    """
-    render_clean_html(cow_badge_html)
-
-    # Render physical block diagram & waste comparison
-    viz_data = p_mgr.get_block_table_visualization()
-    waste_metrics = p_mgr.compare_waste(max_seq_len=2048)
-
-    st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
-    render_paged_kv_block_diagram(viz_data)
-
-    st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
-    st.markdown('<div style="font-size: 1.05rem; font-weight: 700; color: #ffffff; margin-bottom: 8px;">Contiguous Over-Reservation vs Paged KV-Cache Efficiency:</div>', unsafe_allow_html=True)
-    render_kv_waste_comparison_chart(waste_metrics)
 
 
 # ===========================================================================
@@ -1585,87 +1383,10 @@ elif nav_section == "👥 Multi-Process View":
                 f"- **Configured Budget:** {format_bytes(budget_bytes)}\n"
                 f"- **Safety Margin:** {safety_margin_pct}% ({format_bytes(safety_margin_bytes)})"
             )
-
-
-# ===========================================================================
-# VIEW 5: OPTIMIZATION RECOMMENDATIONS (RULES & BATCH SIZING)
-# ===========================================================================
-elif nav_section == "🔧 Optimization Recommendations":
-    st.subheader("🚀 Optimization Engine & Deterministic Rule Heuristics")
-    st.caption("Automated diagnosis of memory anti-patterns with deterministic recommendations.")
-
-    active_df = uploaded_df if not uploaded_df.empty else df_torch
-    recs_list = []
-
-    # Check if pre-recorded recs_json exists
-    if recs_json and recs_json.is_file():
-        try:
-            with open(recs_json, "r", encoding="utf-8") as f:
-                saved_recs_data = json.load(f)
-                if isinstance(saved_recs_data, dict):
-                    recs_list = saved_recs_data.get("recommendations", [])
-                elif isinstance(saved_recs_data, list):
-                    recs_list = saved_recs_data
-        except Exception:
-            pass
-
-    # If no pre-recorded recommendations, dynamically generate from active_df
-    if not recs_list and not active_df.empty:
-        try:
-            engine = RecommendationEngine(budget_bytes=budget_bytes, safety_margin_ratio=safety_margin_pct / 100.0)
-            recs_data = engine.generate_recommendations(active_df.to_dict("records"))
-            recs_list = recs_data.get("recommendations", [])
-        except Exception:
-            pass
-
-    col_recs, col_batch = st.columns([1, 1])
-    with col_recs:
-        st.markdown("#### Prescribed Optimization Rules")
-        if recs_list:
-            for r in recs_list:
-                render_recommendation_card(r)
-        else:
-            render_vision_recommendations_list()
-
-    with col_batch:
-        st.markdown("#### Interactive Batch Size Optimizer")
-        st.caption("Evaluate candidate batch sizes against budget and safety constraints using linear memory modeling.")
-        base_mb = st.slider("Base Model Weights & Buffers (MiB)", 256, 4096, 1200, 128)
-        sample_mb = st.slider("Activation Footprint Per Sample (MiB)", 8, 256, 45, 4)
-
-        optimizer = BatchOptimizer(
-            budget_bytes=budget_bytes,
-            safety_margin_ratio=safety_margin_pct / 100.0,
-        )
-        candidates = optimizer.evaluate_sweep(
-            base_bytes=int(base_mb * 1024 * 1024),
-            activation_per_sample_bytes=int(sample_mb * 1024 * 1024),
-            candidates=[8, 16, 32, 48, 64, 96, 128],
-        )
-        best_fit = optimizer.select_best_viable_candidate(candidates)
-        if best_fit:
-            st.success(f"Recommended Safe Operational Batch Size: **{best_fit.batch_size}** (Est. Peak: {format_bytes(best_fit.estimated_peak_bytes)})")
-
-        c_rows = []
-        for c in candidates:
-            status_color = "#10b981" if c.status == "VIABLE" else ("#f59e0b" if c.status == "RISKY" else "#f43f5e")
-            c_rows.append({
-                "Batch": c.batch_size,
-                "Estimated Peak": format_bytes(c.estimated_peak_bytes),
-                "Status": f'<span style="color: {status_color}; font-weight: 700;">{c.status}</span>',
-                "Note": c.recommendation_note,
-            })
-        st.write(pd.DataFrame(c_rows).to_html(escape=False, index=False), unsafe_allow_html=True)
-
-
-# ===========================================================================
-# VIEW 5.1 & 5.2 DISPATCHERS: OOM DEFENSE & PAGED KV-CACHE
+# VIEW 5.1 DISPATCHER: OOM DEFENSE
 # ===========================================================================
 elif nav_section == "⚡ OOM Defense & Tiered Swapper":
     render_oom_defense_swapper_view()
-
-elif nav_section == "🗂️ Generative AI Paged KV-Cache":
-    render_paged_kv_cache_view()
 
 
 # ===========================================================================
