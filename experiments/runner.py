@@ -47,12 +47,19 @@ File: experiments/runner.py
 """
 
 import concurrent.futures
+import gc
 import sys
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 # ---------------------------------------------------------------------------
 # Project root on sys.path
@@ -139,6 +146,170 @@ def default_mock_runner(spec: WorkloadSpec) -> WorkloadExecutionResult:
         oom_occurred=False,
         notes="Executed via default mock runner (uninstrumented peak)",
     )
+
+
+def real_gpu_workload_runner(spec: WorkloadSpec) -> WorkloadExecutionResult:
+    """
+    1. The use of function:
+       Executes an authentic PyTorch deep learning workload on physical CUDA GPU hardware,
+       measuring actual execution runtime and peak GPU memory allocated with strict error handling,
+       headroom pre-checking, and guaranteed resource reclamation.
+
+    2. How does the specific function work:
+       Validates PyTorch and CUDA availability. Evaluates device free memory against the declared
+       estimated requirement plus safety buffer. If insufficient, returns OOM status to protect
+       system stability. Constructs a real neural network module (Small CNN, ResNet Stage, or Linear MLP)
+       sized according to spec, sets precision (FP32 or FP16), creates input tensors, resets CUDA peak
+       memory stats, and executes the specified pass (forward-only or forward-backward). Records elapsed
+       wall-clock time and peak allocated VRAM (via torch.cuda.max_memory_allocated()). In a guaranteed
+       finally block, explicitly deletes all models and tensors, invokes gc.collect(), and empties the CUDA cache.
+
+    3. Concepts used in the function:
+       Hardware-level deep learning execution, PyTorch peak memory profiling, CUDA synchronization,
+       dynamic precision casting, safe headroom validation, and deterministic resource release.
+
+    4. Places where this function is imported and used:
+       Imported by dashboard/app.py in Tab 5 (Workload Manager) and Tab 7 (Profiling & Benchmark Reports),
+       and tested in tests/test_real_benchmarks.py.
+
+    5. Final output of the function, before and after:
+       Before: WorkloadSpec configuration parameters.
+       After: WorkloadExecutionResult populated with actual runtime_s, peak_memory_bytes, status,
+              and detailed execution diagnostics.
+    """
+    if not HAS_TORCH or not torch.cuda.is_available():
+        return WorkloadExecutionResult(
+            status=ExperimentStatus.FAILED,
+            runtime_s=None,
+            peak_memory_bytes=None,
+            oom_occurred=False,
+            error_message="CUDA accelerator not available for hardware execution",
+            notes="Hardware execution requested but CUDA is unavailable",
+        )
+
+    # Pre-execution safety headroom check
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info()
+    except Exception as exc:
+        return WorkloadExecutionResult(
+            status=ExperimentStatus.FAILED,
+            runtime_s=None,
+            peak_memory_bytes=None,
+            oom_occurred=False,
+            error_message=f"Failed to query device memory: {exc}",
+        )
+
+    safe_margin = 256 * 1024 * 1024  # 256 MB buffer
+    if free_bytes < (spec.estimated_bytes + safe_margin):
+        return WorkloadExecutionResult(
+            status=ExperimentStatus.OOM,
+            runtime_s=None,
+            peak_memory_bytes=None,
+            oom_occurred=True,
+            error_message=(
+                f"Insufficient safe VRAM headroom ({free_bytes // (1024*1024)} MB available < "
+                f"estimated {spec.estimated_bytes // (1024*1024)} MB + 256 MB safety buffer)"
+            ),
+            notes="Aborted pre-execution to prevent unmanaged CUDA Out-Of-Memory condition",
+        )
+
+    model = None
+    inputs = None
+    outputs = None
+    loss = None
+    start_time = time.time()
+
+    try:
+        # Pre-cleanup and peak reset
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        batch_size = max(1, spec.batch_size or 16)
+        name_lower = spec.workload_name.lower()
+
+        # Build realistic PyTorch architecture based on workload specification
+        if "resnet" in name_lower:
+            model = torch.nn.Sequential(
+                torch.nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                torch.nn.BatchNorm2d(128),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(128, 128, kernel_size=3, padding=1),
+                torch.nn.BatchNorm2d(128),
+                torch.nn.ReLU(),
+            ).cuda()
+            inputs = torch.randn(batch_size, 64, 32, 32, device="cuda")
+        elif "mlp" in name_lower or "linear" in name_lower:
+            model = torch.nn.Sequential(
+                torch.nn.Linear(1024, 2048),
+                torch.nn.ReLU(),
+                torch.nn.Linear(2048, 1024),
+            ).cuda()
+            inputs = torch.randn(batch_size, 1024, device="cuda")
+        else:
+            # Default: Small CNN
+            model = torch.nn.Sequential(
+                torch.nn.Conv2d(3, 32, kernel_size=3, padding=1),
+                torch.nn.BatchNorm2d(32),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                torch.nn.BatchNorm2d(64),
+                torch.nn.ReLU(),
+                torch.nn.AdaptiveAvgPool2d((1, 1)),
+            ).cuda()
+            inputs = torch.randn(batch_size, 3, 64, 64, device="cuda")
+
+        # Precision handling
+        is_half = spec.precision and ("16" in spec.precision.lower())
+        if is_half:
+            model = model.half()
+            inputs = inputs.half()
+
+        pass_type = "forward_only"
+        if spec.metadata and spec.metadata.get("pass_type") == "forward_backward":
+            pass_type = "forward_backward"
+
+        if pass_type == "forward_backward":
+            outputs = model(inputs)
+            loss = outputs.sum()
+            loss.backward()
+            pass_desc = "Forward + Backward Pass"
+        else:
+            with torch.no_grad():
+                outputs = model(inputs)
+            pass_desc = "Forward-Only Pass"
+
+        torch.cuda.synchronize()
+        runtime_s = round(time.time() - start_time, 4)
+        peak_bytes = int(torch.cuda.max_memory_allocated())
+        gpu_name = torch.cuda.get_device_name(0)
+
+        return WorkloadExecutionResult(
+            status=ExperimentStatus.SUCCESS,
+            runtime_s=runtime_s,
+            peak_memory_bytes=peak_bytes,
+            oom_occurred=False,
+            notes=f"Executed real GPU {pass_desc} (Batch {batch_size}, {spec.precision or 'FP32'}) on {gpu_name}",
+        )
+
+    except Exception as exc:
+        runtime_s = round(time.time() - start_time, 4)
+        err_str = str(exc)
+        is_oom = "out of memory" in err_str.lower() or "cuda oom" in err_str.lower()
+        return WorkloadExecutionResult(
+            status=ExperimentStatus.OOM if is_oom else ExperimentStatus.FAILED,
+            runtime_s=runtime_s,
+            peak_memory_bytes=None,
+            oom_occurred=is_oom,
+            error_message=err_str,
+            notes=f"Exception encountered during hardware execution: {type(exc).__name__}",
+        )
+
+    finally:
+        del model, inputs, outputs, loss
+        gc.collect()
+        if HAS_TORCH and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
