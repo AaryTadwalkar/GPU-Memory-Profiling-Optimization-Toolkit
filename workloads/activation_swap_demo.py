@@ -68,8 +68,9 @@ def cleanup_system_and_gpu_memory() -> None:
        host CPU system RAM and accelerator GPU VRAM to ensure zero leaked memory between benchmark runs.
 
     2. How does the specific function work:
-       Invokes Python `gc.collect()`. If CUDA is available, calls `torch.cuda.empty_cache()` and
-       `torch.cuda.ipc_collect()` to release cached device memory and unmap pinned host memory.
+       Invokes Python `gc.collect()`. If CUDA is available, synchronizes streams with `torch.cuda.synchronize()`,
+       calls `torch.cuda.empty_cache()` and `torch.cuda.ipc_collect()` to release cached device memory
+       and unmap pinned host memory.
 
     3. Concepts used in the function:
        Garbage collection, CUDA caching allocator purge, inter-process communication cache reclaim.
@@ -85,10 +86,12 @@ def cleanup_system_and_gpu_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         try:
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         except Exception:
             pass
+    gc.collect()
 
 
 class RealConvNetStage(nn.Module):
@@ -760,6 +763,7 @@ def run_live_1min_benchmark(
     max_steps_p2: int = 14,
     callback: Optional[Callable[[BenchmarkStepRecord], None]] = None,
     mode: str = "both",
+    stop_event: Optional[Any] = None,
 ) -> LiveBenchmarkSummary:
     """
     1. The use of function:
@@ -868,6 +872,8 @@ def run_live_1min_benchmark(
             p1_start = time.time()
             step_p1 = 0
             while step_p1 < max_steps_p1 and not phase1_crashed:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if (time.time() - p1_start) >= phase1_duration_s:
                     break
 
@@ -879,9 +885,14 @@ def run_live_1min_benchmark(
                     out_p1 = model_p1(x_p1)
                     loss_p1 = out_p1.sum()
 
-                    # Measure physical VRAM on CUDA or ramp on CPU
+                    # Measure physical dedicated VRAM on CUDA for Task Manager parity, or ramp on CPU
                     if is_cuda and not simulate:
-                        current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
+                        try:
+                            import pynvml
+                            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                            current_vram = pynvml.nvmlDeviceGetMemoryInfo(h).used / (1024 * 1024)
+                        except Exception:
+                            current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
                     else:
                         progress = min(1.0, step_p1 / max(1, min(max_steps_p1, 4)))
                         current_vram = (vram_budget_mb * 0.52) + (progress * (vram_budget_mb * 0.46))
@@ -1003,10 +1014,25 @@ def run_live_1min_benchmark(
         if mode in ("both", "swapper_only"):
             cleanup_system_and_gpu_memory()
 
-            effective_thresh_mb = min(float(offload_threshold_mb), vram_budget_mb * 0.85)
-            if is_cuda and not simulate and ("real" in clean_type or "conv" in clean_type or "resnet" in clean_type):
-                effective_thresh_mb = min(effective_thresh_mb, 3600.0)
-            pressure_threshold_bytes = int(effective_thresh_mb * 1024 * 1024)
+            effective_thresh_mb = min(float(offload_threshold_mb), vram_budget_mb * 0.95)
+            # Query baseline driver memory from background OS applications
+            driver_base_bytes = 0
+            if is_cuda and not simulate:
+                try:
+                    import pynvml
+                    if not pynvml._nvml_initialized:
+                        pynvml.nvmlInit()
+                    h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    driver_info = pynvml.nvmlDeviceGetMemoryInfo(h)
+                    driver_base_bytes = max(0, driver_info.used - torch.cuda.memory_allocated(device))
+                except Exception:
+                    pass
+
+            target_thresh_bytes = int(effective_thresh_mb * 1024 * 1024)
+            if driver_base_bytes > 0 and target_thresh_bytes > (driver_base_bytes + 256 * 1024 * 1024):
+                pressure_threshold_bytes = target_thresh_bytes - driver_base_bytes
+            else:
+                pressure_threshold_bytes = min(target_thresh_bytes, int(vram_budget_mb * 0.90 * 1024 * 1024))
 
             manager = TieredActivationManager(
                 pressure_threshold_bytes=pressure_threshold_bytes,
@@ -1019,6 +1045,8 @@ def run_live_1min_benchmark(
             p2_start = time.time()
             step_p2 = 0
             while step_p2 < max_steps_p2:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if (time.time() - p2_start) >= phase2_duration_s:
                     break
 
@@ -1033,7 +1061,12 @@ def run_live_1min_benchmark(
                 with manager:
                     out_p2 = model_p2(x_p2)
                     if is_cuda and not simulate:
-                        current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
+                        try:
+                            import pynvml
+                            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                            current_vram = pynvml.nvmlDeviceGetMemoryInfo(h).used / (1024 * 1024)
+                        except Exception:
+                            current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
                         current_host = manager.total_bytes_offloaded / (1024 * 1024)
 
                 loss_p2 = out_p2.sum()
