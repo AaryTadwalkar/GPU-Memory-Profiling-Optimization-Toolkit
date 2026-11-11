@@ -175,6 +175,131 @@ def parse_snapshot_detailed(
     }
 
 
+def get_passive_allocator_status() -> Dict[str, Any]:
+    """
+    1. The use of function:
+       Passively samples PyTorch caching allocator statistics and device memory without
+       allocating any artificial tensors or mutating the hardware/driver state.
+
+    2. How does the specific function work:
+       Checks PyTorch and CUDA availability. Queries torch.cuda.memory_allocated(),
+       torch.cuda.memory_reserved(), torch.cuda.max_memory_allocated(),
+       torch.cuda.max_memory_reserved(), and torch.cuda.memory_stats(). Distinguishes
+       between an idle allocator pool (0 MB reserved) and an active fragmented pool.
+       When the pool is dormant, reports FSFI as None (N/A) with explicit notes,
+       preventing false 0.0000 or fabricated fragmentation readings. When the pool is active,
+       evaluates inactive_split_bytes and active segments.
+
+    3. Concepts used in the function:
+       PyTorch caching allocator introspection, passive telemetry sampling, virtual memory
+       pool state distinction (idle vs fragmented).
+
+    4. Places where this function is imported and used:
+       Imported by dashboard/app.py in Tab 3 (Mode A: Passive Live Allocator Monitoring)
+       and verified in unit tests.
+
+    5. Final output of the function, before and after:
+       Before: Raw uninspected allocator runtime.
+       After: Structured dictionary with allocated_bytes, reserved_bytes, pool_free_bytes,
+              inactive_split_bytes, max_allocated_bytes, max_reserved_bytes,
+              allocation_retries, active_segments, is_idle, fsfi, and status_description.
+    """
+    if not HAS_TORCH or not torch.cuda.is_available():
+        return {
+            "available": False,
+            "is_idle": True,
+            "status_description": "CUDA accelerator not available or PyTorch CUDA runtime absent.",
+            "allocated_bytes": 0,
+            "reserved_bytes": 0,
+            "pool_free_bytes": 0,
+            "inactive_split_bytes": 0,
+            "max_allocated_bytes": 0,
+            "max_reserved_bytes": 0,
+            "allocation_retries": 0,
+            "active_segments": 0,
+            "driver_free_bytes": 0,
+            "driver_total_bytes": 0,
+            "fsfi": None,
+            "distinction_note": "Hardware unavailable.",
+        }
+
+    try:
+        alloc = torch.cuda.memory_allocated()
+        resv = torch.cuda.memory_reserved()
+        max_alloc = torch.cuda.max_memory_allocated()
+        max_resv = torch.cuda.max_memory_reserved()
+        driver_free, driver_total = torch.cuda.mem_get_info()
+
+        stats = {}
+        try:
+            stats = torch.cuda.memory_stats()
+        except Exception:
+            pass
+
+        inactive_split = stats.get("inactive_split_bytes.all.current", 0)
+        retries = stats.get("num_alloc_retries", 0)
+        seg_alloc = stats.get("segment.all.allocated", 0)
+        seg_freed = stats.get("segment.all.freed", 0)
+        active_segs = max(0, seg_alloc - seg_freed)
+
+        pool_free = max(0, resv - alloc)
+        is_idle = (resv == 0)
+
+        if is_idle:
+            status_desc = "Current Process Allocator Idle (0 MB reserved)"
+            note = (
+                "Allocator pool is dormant. No virtual memory segments have been acquired by this "
+                "process. FSFI is undefined and reported as N/A (distinguished from 0.0000 fragmentation)."
+            )
+            fsfi_val = None
+        else:
+            status_desc = f"Active Allocator Pool ({alloc // (1024*1024)} MB allocated / {resv // (1024*1024)} MB reserved)"
+            note = (
+                f"Active segments: {active_segs}. Inactive split free space: "
+                f"{inactive_split // (1024*1024)} MB of {pool_free // (1024*1024)} MB pool free."
+            )
+            if pool_free > 0 and inactive_split > 0:
+                fsfi_val = round(min(1.0, inactive_split / float(pool_free)), 4)
+            else:
+                fsfi_val = 0.0
+
+        return {
+            "available": True,
+            "is_idle": is_idle,
+            "status_description": status_desc,
+            "allocated_bytes": alloc,
+            "reserved_bytes": resv,
+            "pool_free_bytes": pool_free,
+            "inactive_split_bytes": inactive_split,
+            "max_allocated_bytes": max_alloc,
+            "max_reserved_bytes": max_resv,
+            "allocation_retries": retries,
+            "active_segments": active_segs,
+            "driver_free_bytes": driver_free,
+            "driver_total_bytes": driver_total,
+            "fsfi": fsfi_val,
+            "distinction_note": note,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "is_idle": True,
+            "status_description": f"Failed to sample allocator: {exc}",
+            "allocated_bytes": 0,
+            "reserved_bytes": 0,
+            "pool_free_bytes": 0,
+            "inactive_split_bytes": 0,
+            "max_allocated_bytes": 0,
+            "max_reserved_bytes": 0,
+            "allocation_retries": 0,
+            "active_segments": 0,
+            "driver_free_bytes": 0,
+            "driver_total_bytes": 0,
+            "fsfi": None,
+            "distinction_note": f"Exception encountered: {exc}",
+        }
+
+
 def capture_live_fragmentation_snapshot(
     tensor_count: int = 16,
     tensor_size_mb: int = 8,
@@ -246,13 +371,23 @@ def capture_live_fragmentation_snapshot(
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Stage 1: Baseline state before experiment
+        b_alloc = torch.cuda.memory_allocated()
+        b_resv = torch.cuda.memory_reserved()
+        b_driver_free, _ = torch.cuda.mem_get_info()
+
         elements_per_tensor = (tensor_size_mb * 1024 * 1024) // 4  # FP32 = 4 bytes
         for _ in range(tensor_count):
             t = torch.randn(elements_per_tensor, dtype=torch.float32, device="cuda")
             tensors.append(t)
             time.sleep(0.005)
 
-        # Alternating deletion to punch holes
+        # Stage 2: Post-allocation state
+        a_alloc = torch.cuda.memory_allocated()
+        a_resv = torch.cuda.memory_reserved()
+        a_driver_free, _ = torch.cuda.mem_get_info()
+
+        # Stage 3: Alternating deletion to punch holes
         kept_tensors: List[torch.Tensor] = []
         for idx, t in enumerate(tensors):
             if idx % 2 == 0 and t is not None:
@@ -262,7 +397,7 @@ def capture_live_fragmentation_snapshot(
         tensors = kept_tensors
         time.sleep(0.05)
 
-        # Phase 1: Capture fragmented state
+        # Capture fragmented state (Stage 3)
         snap1_data = torch.cuda.memory_snapshot()
         with open(snap1_file, "w", encoding="utf-8") as f:
             json.dump(snap1_data, f)
@@ -275,7 +410,7 @@ def capture_live_fragmentation_snapshot(
         # Inactive block creation verification
         inactive_blocks_created = p1_details["inactive_block_count"] > 0
 
-        # Phase 2: Call empty_cache() to release inactive segments
+        # Stage 4: Call empty_cache() to release inactive segments
         torch.cuda.empty_cache()
         time.sleep(0.05)
 
@@ -292,6 +427,16 @@ def capture_live_fragmentation_snapshot(
         reserved_delta_mb = (p1_resv - p2_resv) / (1024.0 * 1024.0)
         driver_free_delta_mb = (p2_driver_free - p1_driver_free) / (1024.0 * 1024.0)
         inactive_delta_mb = (p1_details["total_inactive_bytes"] - p2_details["total_inactive_bytes"]) / (1024.0 * 1024.0)
+
+        # OS Concept Explanation: Segment Pinning
+        segment_pinning_explanation = (
+            "OS Memory Concept (Segment Pinning): In PyTorch's caching allocator, memory is reserved "
+            "in contiguous virtual memory segments (typically 20 MB or 512 MB blocks). An allocated segment "
+            "can only be returned to the OS / NVIDIA driver via cudaFree if EVERY block inside that segment "
+            "is inactive. If alternating deleted tensors leave even a single active tensor in each segment "
+            "(segment pinning), empty_cache() cannot free any segment back to the NVIDIA driver, resulting in "
+            "0 MB released to the OS driver despite high internal pool fragmentation."
+        )
 
         # Objective, non-prescriptive explanation
         if inactive_blocks_created:
@@ -319,6 +464,17 @@ def capture_live_fragmentation_snapshot(
             "inactive_blocks_created": inactive_blocks_created,
             "snapshot_fragmented_path": str(snap1_file),
             "snapshot_post_empty_path": str(snap2_file),
+            "stage1_baseline": {
+                "allocated_bytes": b_alloc,
+                "reserved_bytes": b_resv,
+                "driver_free_bytes": b_driver_free,
+            },
+            "stage2_allocated": {
+                "allocated_bytes": a_alloc,
+                "reserved_bytes": a_resv,
+                "driver_free_bytes": a_driver_free,
+                "tensor_count": tensor_count,
+            },
             "phase1_fragmented": {
                 "allocated_bytes": p1_alloc,
                 "reserved_bytes": p1_resv,
@@ -341,6 +497,7 @@ def capture_live_fragmentation_snapshot(
             "driver_free_gained_mb": round(max(0.0, driver_free_delta_mb), 2),
             "inactive_memory_released_mb": round(max(0.0, inactive_delta_mb), 2),
             "explanation": explanation,
+            "segment_pinning_explanation": segment_pinning_explanation,
             "all_blocks_phase1": p1_details["all_blocks"],
             "all_blocks_phase2": p2_details["all_blocks"],
         }

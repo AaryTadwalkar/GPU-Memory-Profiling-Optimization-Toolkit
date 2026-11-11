@@ -759,6 +759,7 @@ def run_live_1min_benchmark(
     max_steps_p1: int = 10,
     max_steps_p2: int = 14,
     callback: Optional[Callable[[BenchmarkStepRecord], None]] = None,
+    mode: str = "both",
 ) -> LiveBenchmarkSummary:
     """
     1. The use of function:
@@ -806,12 +807,8 @@ def run_live_1min_benchmark(
     cleanup_system_and_gpu_memory()
 
     # Resolve effective batch sizes
-    if not simulate and is_cuda:
-        effective_batch_p1 = 96 if batch_p1 <= 32 else int(batch_p1)
-        effective_batch_p2 = 96 if batch_p2 <= 64 else int(batch_p2)
-    else:
-        effective_batch_p1 = int(batch_p1)
-        effective_batch_p2 = int(batch_p2)
+    effective_batch_p1 = int(batch_p1)
+    effective_batch_p2 = int(batch_p2)
 
     try:
         # Initialize neural architectures
@@ -859,41 +856,74 @@ def run_live_1min_benchmark(
         peak_host_ram = 0.0
         total_swapped_bytes = 0
         total_swapped_tensors = 0
+        manager: Optional[TieredActivationManager] = None
+        p1_actual_duration = 0.0
+        p2_actual_duration = 0.0
 
         # -------------------------------------------------------------------
         # PHASE 1: Baseline GPU Training (Step-Based Execution, 8-12 Steps)
         # Mini-Batch = batch_p1, No swapper, VRAM saturating / Real OOM boundary
         # -------------------------------------------------------------------
-        p1_start = time.time()
-        step_p1 = 0
-        while step_p1 < max_steps_p1 and not phase1_crashed:
-            if (time.time() - p1_start) >= phase1_duration_s:
-                break
+        if mode in ("both", "baseline_only"):
+            p1_start = time.time()
+            step_p1 = 0
+            while step_p1 < max_steps_p1 and not phase1_crashed:
+                if (time.time() - p1_start) >= phase1_duration_s:
+                    break
 
-            step_p1 += 1
-            elapsed_total = time.time() - benchmark_start
+                step_p1 += 1
+                elapsed_total = time.time() - benchmark_start
 
-            try:
-                model_p1.zero_grad(set_to_none=True)
-                out_p1 = model_p1(x_p1)
-                loss_p1 = out_p1.sum()
+                try:
+                    model_p1.zero_grad(set_to_none=True)
+                    out_p1 = model_p1(x_p1)
+                    loss_p1 = out_p1.sum()
 
-                # Measure physical VRAM on CUDA or ramp on CPU
-                if is_cuda and not simulate:
-                    current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
-                else:
-                    progress = min(1.0, step_p1 / max(1, min(max_steps_p1, 4)))
-                    current_vram = (vram_budget_mb * 0.52) + (progress * (vram_budget_mb * 0.46))
+                    # Measure physical VRAM on CUDA or ramp on CPU
+                    if is_cuda and not simulate:
+                        current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
+                    else:
+                        progress = min(1.0, step_p1 / max(1, min(max_steps_p1, 4)))
+                        current_vram = (vram_budget_mb * 0.52) + (progress * (vram_budget_mb * 0.46))
 
-                phase1_peak_vram = max(phase1_peak_vram, current_vram)
+                    phase1_peak_vram = max(phase1_peak_vram, current_vram)
 
-                # Check simulated baseline ceiling or physical breach
-                if simulate_oom_on_baseline and (current_vram >= vram_budget_mb * 0.92 or step_p1 >= 3):
-                    phase1_crashed = True
-                    err_detail = (
-                        f"CUDA out of memory. Tried to allocate 1.45 GiB (GPU 0; {vram_budget_mb/1024:.2f} GiB total capacity; "
-                        f"{current_vram/1024:.2f} GiB allocated; 112 MiB free; PyTorch caching allocator OOM on batch {effective_batch_p1})."
-                    )
+                    # Check simulated baseline ceiling or physical breach
+                    if simulate_oom_on_baseline and current_vram >= vram_budget_mb * 0.92:
+                        phase1_crashed = True
+                        err_detail = (
+                            f"CUDA out of memory. Tried to allocate 1.45 GiB (GPU 0; {vram_budget_mb/1024:.2f} GiB total capacity; "
+                            f"{current_vram/1024:.2f} GiB allocated; 112 MiB free; PyTorch caching allocator OOM on batch {effective_batch_p1})."
+                        )
+                        rec = BenchmarkStepRecord(
+                            timestamp=time.time(),
+                            elapsed_s=round(elapsed_total, 2),
+                            phase_id=1,
+                            phase_name="Phase 1: Baseline GPU Training",
+                            step=step_p1,
+                            batch_size=effective_batch_p1,
+                            vram_used_mb=round(current_vram, 2),
+                            host_ram_used_mb=0.0,
+                            status="CRASHED: Out-Of-Memory (OOM)",
+                            tensors_swapped=0,
+                            bytes_swapped=0,
+                            gradient_matched=False,
+                            error_message=err_detail,
+                        )
+                        records.append(rec)
+                        if callback:
+                            callback(rec)
+                        # Purge Phase 1 tensors immediately
+                        if 'out_p1' in locals(): del out_p1
+                        if 'loss_p1' in locals(): del loss_p1
+                        del model_p1, x_p1
+                        cleanup_system_and_gpu_memory()
+                        break
+
+                    loss_p1.backward()
+                    del out_p1, loss_p1
+
+                    status_str = "RUNNING (VRAM Pressure High)" if current_vram > (vram_budget_mb * 0.8) else "RUNNING (Baseline)"
                     rec = BenchmarkStepRecord(
                         timestamp=time.time(),
                         elapsed_s=round(elapsed_total, 2),
@@ -903,11 +933,31 @@ def run_live_1min_benchmark(
                         batch_size=effective_batch_p1,
                         vram_used_mb=round(current_vram, 2),
                         host_ram_used_mb=0.0,
+                        status=status_str,
+                        tensors_swapped=0,
+                        bytes_swapped=0,
+                        gradient_matched=True,
+                    )
+                    records.append(rec)
+                    if callback:
+                        callback(rec)
+
+                except (torch.cuda.OutOfMemoryError, Exception) as oom_err:
+                    phase1_crashed = True
+                    rec = BenchmarkStepRecord(
+                        timestamp=time.time(),
+                        elapsed_s=round(elapsed_total, 2),
+                        phase_id=1,
+                        phase_name="Phase 1: Baseline GPU Training",
+                        step=step_p1,
+                        batch_size=effective_batch_p1,
+                        vram_used_mb=round(vram_budget_mb, 2),
+                        host_ram_used_mb=0.0,
                         status="CRASHED: Out-Of-Memory (OOM)",
                         tensors_swapped=0,
                         bytes_swapped=0,
                         gradient_matched=False,
-                        error_message=err_detail,
+                        error_message=str(oom_err),
                     )
                     records.append(rec)
                     if callback:
@@ -915,177 +965,138 @@ def run_live_1min_benchmark(
                     # Purge Phase 1 tensors immediately
                     if 'out_p1' in locals(): del out_p1
                     if 'loss_p1' in locals(): del loss_p1
-                    del model_p1, x_p1
+                    if 'model_p1' in locals(): del model_p1
+                    if 'x_p1' in locals(): del x_p1
                     cleanup_system_and_gpu_memory()
                     break
 
-                loss_p1.backward()
-                del out_p1, loss_p1
+                if step_interval_s > 0:
+                    time.sleep(step_interval_s)
 
-                status_str = "RUNNING (VRAM Pressure High)" if current_vram > (vram_budget_mb * 0.8) else "RUNNING (Baseline)"
+            p1_actual_duration = time.time() - p1_start
+
+            # If Phase 1 crashed and running both, record transition tick
+            if phase1_crashed and mode == "both":
+                transition_rec = BenchmarkStepRecord(
+                    timestamp=time.time(),
+                    elapsed_s=round(time.time() - benchmark_start, 2),
+                    phase_id=1,
+                    phase_name="Phase 1: Baseline GPU Training",
+                    step=step_p1 + 1,
+                    batch_size=effective_batch_p1,
+                    vram_used_mb=round(phase1_peak_vram, 2),
+                    host_ram_used_mb=0.0,
+                    status="HALTED: OOM Crash (Transitioning to Swapper)",
+                    tensors_swapped=0,
+                    bytes_swapped=0,
+                    gradient_matched=False,
+                    error_message="Baseline aborted due to memory exhaustion. Activating TieredActivationManager for Phase 2...",
+                )
+                records.append(transition_rec)
+                if callback:
+                    callback(transition_rec)
+
+        # -------------------------------------------------------------------
+        # PHASE 2: Active Tiered Swapper (Dynamic Steps, 12-16 Steps)
+        # Mini-Batch = batch_p2, Clamped VRAM, Dynamic Host CPU RAM spill
+        # -------------------------------------------------------------------
+        if mode in ("both", "swapper_only"):
+            cleanup_system_and_gpu_memory()
+
+            effective_thresh_mb = min(float(offload_threshold_mb), vram_budget_mb * 0.85)
+            if is_cuda and not simulate and ("real" in clean_type or "conv" in clean_type or "resnet" in clean_type):
+                effective_thresh_mb = min(effective_thresh_mb, 3600.0)
+            pressure_threshold_bytes = int(effective_thresh_mb * 1024 * 1024)
+
+            manager = TieredActivationManager(
+                pressure_threshold_bytes=pressure_threshold_bytes,
+                min_tensor_size_bytes=256 * 1024 if is_cuda else 64 * 1024,
+                use_pinned_memory=False,
+                enabled=True,
+                simulate_on_cpu=(simulate or not is_cuda),
+            )
+
+            p2_start = time.time()
+            step_p2 = 0
+            while step_p2 < max_steps_p2:
+                if (time.time() - p2_start) >= phase2_duration_s:
+                    break
+
+                step_p2 += 1
+                elapsed_total = time.time() - benchmark_start
+
+                model_p2.zero_grad(set_to_none=True)
+                if is_cuda:
+                    torch.cuda.empty_cache()
+                manager.reset()
+
+                with manager:
+                    out_p2 = model_p2(x_p2)
+                    if is_cuda and not simulate:
+                        current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
+                        current_host = manager.total_bytes_offloaded / (1024 * 1024)
+
+                loss_p2 = out_p2.sum()
+                loss_p2.backward()
+                del out_p2, loss_p2
+
+                if not is_cuda or simulate:
+                    # CPU simulation mode
+                    current_vram = min(offload_threshold_mb * 0.88, vram_budget_mb * 0.72)
+                    base_host_spill = max(1800.0, (vram_budget_mb * 0.52))
+                    oscillation = (step_p2 % 4) * 120.0
+                    current_host = base_host_spill + oscillation
+
+                phase2_peak_vram = max(phase2_peak_vram, current_vram)
+                peak_host_ram = max(peak_host_ram, current_host)
+                total_swapped_bytes = max(total_swapped_bytes, int(current_host * 1024 * 1024))
+                total_swapped_tensors = max(
+                    total_swapped_tensors,
+                    manager.total_tensors_offloaded if manager.total_tensors_offloaded > 0 else (step_p2 * 12)
+                )
+
+                speedup_factor = round(effective_batch_p2 / max(1, effective_batch_p1), 1)
+                speedup_label = f" ({speedup_factor}x Batch)" if effective_batch_p2 != effective_batch_p1 else ""
                 rec = BenchmarkStepRecord(
                     timestamp=time.time(),
                     elapsed_s=round(elapsed_total, 2),
-                    phase_id=1,
-                    phase_name="Phase 1: Baseline GPU Training",
-                    step=step_p1,
-                    batch_size=effective_batch_p1,
+                    phase_id=2,
+                    phase_name=f"Phase 2: Active Tiered Swapper{speedup_label}",
+                    step=step_p2,
+                    batch_size=effective_batch_p2,
                     vram_used_mb=round(current_vram, 2),
-                    host_ram_used_mb=0.0,
-                    status=status_str,
-                    tensors_swapped=0,
-                    bytes_swapped=0,
+                    host_ram_used_mb=round(current_host, 2),
+                    status=f"PROTECTED: Zero-OOM Active{speedup_label}",
+                    tensors_swapped=total_swapped_tensors,
+                    bytes_swapped=total_swapped_bytes,
                     gradient_matched=True,
                 )
                 records.append(rec)
                 if callback:
                     callback(rec)
 
-            except (torch.cuda.OutOfMemoryError, Exception) as oom_err:
-                phase1_crashed = True
-                rec = BenchmarkStepRecord(
-                    timestamp=time.time(),
-                    elapsed_s=round(elapsed_total, 2),
-                    phase_id=1,
-                    phase_name="Phase 1: Baseline GPU Training",
-                    step=step_p1,
-                    batch_size=effective_batch_p1,
-                    vram_used_mb=round(vram_budget_mb, 2),
-                    host_ram_used_mb=0.0,
-                    status="CRASHED: Out-Of-Memory (OOM)",
-                    tensors_swapped=0,
-                    bytes_swapped=0,
-                    gradient_matched=False,
-                    error_message=str(oom_err),
-                )
-                records.append(rec)
-                if callback:
-                    callback(rec)
-                # Purge Phase 1 tensors immediately
-                if 'out_p1' in locals(): del out_p1
-                if 'loss_p1' in locals(): del loss_p1
-                if 'model_p1' in locals(): del model_p1
-                if 'x_p1' in locals(): del x_p1
-                cleanup_system_and_gpu_memory()
-                break
+            p2_actual_duration = time.time() - p2_start
 
-        p1_actual_duration = time.time() - p1_start
-
-        # If Phase 1 crashed, record transition tick
-        if phase1_crashed:
-            transition_rec = BenchmarkStepRecord(
-                timestamp=time.time(),
-                elapsed_s=round(time.time() - benchmark_start, 2),
-                phase_id=1,
-                phase_name="Phase 1: Baseline GPU Training",
-                step=step_p1 + 1,
-                batch_size=effective_batch_p1,
-                vram_used_mb=round(phase1_peak_vram, 2),
-                host_ram_used_mb=0.0,
-                status="HALTED: OOM Crash (Transitioning to Swapper)",
-                tensors_swapped=0,
-                bytes_swapped=0,
-                gradient_matched=False,
-                error_message="Baseline aborted due to memory exhaustion. Activating TieredActivationManager for Phase 2...",
-            )
-            records.append(transition_rec)
-            if callback:
-                callback(transition_rec)
-
-        # -------------------------------------------------------------------
-        # PHASE 2: Active Tiered Swapper (Dynamic Steps, 12-16 Steps)
-        # Mini-Batch = batch_p2, Clamped VRAM, Dynamic Host CPU RAM spill
-        # -------------------------------------------------------------------
-        cleanup_system_and_gpu_memory()
-
-        effective_thresh_mb = min(float(offload_threshold_mb), vram_budget_mb * 0.85)
-        if is_cuda and not simulate and ("real" in clean_type or "conv" in clean_type or "resnet" in clean_type):
-            effective_thresh_mb = min(effective_thresh_mb, 3600.0)
-        pressure_threshold_bytes = int(effective_thresh_mb * 1024 * 1024)
-
-        manager = TieredActivationManager(
-            pressure_threshold_bytes=pressure_threshold_bytes,
-            min_tensor_size_bytes=256 * 1024 if is_cuda else 64 * 1024,
-            use_pinned_memory=False,
-            enabled=True,
-            simulate_on_cpu=(simulate or not is_cuda),
-        )
-
-        p2_start = time.time()
-        step_p2 = 0
-        while step_p2 < max_steps_p2:
-            if (time.time() - p2_start) >= phase2_duration_s:
-                break
-
-            step_p2 += 1
-            elapsed_total = time.time() - benchmark_start
-
-            model_p2.zero_grad(set_to_none=True)
-            if is_cuda:
-                torch.cuda.empty_cache()
-            manager.reset()
-
-            with manager:
-                out_p2 = model_p2(x_p2)
-                if is_cuda and not simulate:
-                    current_vram = torch.cuda.memory_allocated(device) / (1024 * 1024)
-                    current_host = manager.total_bytes_offloaded / (1024 * 1024)
-
-            loss_p2 = out_p2.sum()
-            loss_p2.backward()
-            del out_p2, loss_p2
-
-            if not is_cuda or simulate:
-                # CPU simulation mode
-                current_vram = min(offload_threshold_mb * 0.88, vram_budget_mb * 0.72)
-                base_host_spill = max(1800.0, (vram_budget_mb * 0.52))
-                oscillation = (step_p2 % 4) * 120.0
-                current_host = base_host_spill + oscillation
-
-            phase2_peak_vram = max(phase2_peak_vram, current_vram)
-            peak_host_ram = max(peak_host_ram, current_host)
-            total_swapped_bytes = max(total_swapped_bytes, int(current_host * 1024 * 1024))
-            total_swapped_tensors = max(
-                total_swapped_tensors,
-                manager.total_tensors_offloaded if manager.total_tensors_offloaded > 0 else (step_p2 * 12)
-            )
-
-            speedup_factor = round(effective_batch_p2 / max(1, effective_batch_p1), 1)
-            speedup_label = f" ({speedup_factor}x Batch)" if effective_batch_p2 != effective_batch_p1 else ""
-            rec = BenchmarkStepRecord(
-                timestamp=time.time(),
-                elapsed_s=round(elapsed_total, 2),
-                phase_id=2,
-                phase_name=f"Phase 2: Active Tiered Swapper{speedup_label}",
-                step=step_p2,
-                batch_size=effective_batch_p2,
-                vram_used_mb=round(current_vram, 2),
-                host_ram_used_mb=round(current_host, 2),
-                status=f"PROTECTED: Zero-OOM Active{speedup_label}",
-                tensors_swapped=total_swapped_tensors,
-                bytes_swapped=total_swapped_bytes,
-                gradient_matched=True,
-            )
-            records.append(rec)
-            if callback:
-                callback(rec)
-
-        p2_actual_duration = time.time() - p2_start
         total_benchmark_time = time.time() - benchmark_start
 
         # Final gradient equivalence verification
-        single_pass_res = run_activation_swap_demo(
-            device_name="cpu",
-            simulate=True,
-            batch_size=8,
-            features=512,
-            hidden_dim=1024,
-            depth=4,
-            min_tensor_size_bytes=64 * 1024,
-            model_type=clean_type,
-        )
-        grad_equiv = bool(single_pass_res.get("gradient_equivalence", True))
-        max_g_diff = float(single_pass_res.get("max_gradient_diff", 0.0))
+        if mode in ("both", "swapper_only"):
+            single_pass_res = run_activation_swap_demo(
+                device_name="cpu",
+                simulate=True,
+                batch_size=8,
+                features=512,
+                hidden_dim=1024,
+                depth=4,
+                min_tensor_size_bytes=64 * 1024,
+                model_type=clean_type,
+            )
+            grad_equiv = bool(single_pass_res.get("gradient_equivalence", True))
+            max_g_diff = float(single_pass_res.get("max_gradient_diff", 0.0))
+        else:
+            grad_equiv = not phase1_crashed
+            max_g_diff = 0.0
+            single_pass_res = {}
 
         summary = LiveBenchmarkSummary(
             total_duration_s=round(total_benchmark_time, 2),
@@ -1101,7 +1112,7 @@ def run_live_1min_benchmark(
             max_gradient_diff=max_g_diff,
             batch_speedup_ratio=round(effective_batch_p2 / max(1, effective_batch_p1), 2),
             records=[r.to_dict() for r in records],
-            events=[e.to_dict() for e in manager.events] if manager.events else single_pass_res.get("summary", {}).get("events", []),
+            events=[e.to_dict() for e in manager.events] if (manager and manager.events) else single_pass_res.get("summary", {}).get("events", []),
         )
 
         return summary

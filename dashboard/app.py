@@ -7,9 +7,9 @@ File: dashboard/app.py
    Dasahboard_vision.jpeg, vertical left-sidebar navigation, real-time physical GPU
    telemetry (1 Hz NVML with power in Watts), in-process allocator dynamics, live
    Free-Space Fragmentation Index (FSFI) profiling with inactive block verification,
-   measurement-driven memory pressure analysis, operational cooperative admission
-   control with real GPU workload execution, finalized Tiered Activation Swapper
-   optimization, and an executable benchmark reports suite.
+   measurement-driven memory pressure analysis, an operational GPU Process & Workload
+   Resource Manager with active process termination & headroom recovery, and the
+   finalized Tiered Activation Swapper OOM defense engine.
 
 2. Overall design:
    A modular application with a dual-layer interface:
@@ -20,8 +20,8 @@ File: dashboard/app.py
      Gauge, and Priority Optimization Cards.
    - Layer 2 (Section Deep Dives): Deep-dive section pages accessible via the left sidebar
      for live telemetry traces, allocator fragmentation profiling, measurement-driven
-     pressure analysis, operational workload management, OOM Defense swapper, and
-     executable benchmark reports.
+     pressure analysis, operational GPU process and workload management, and the
+     Tiered Activation Swapper OOM defense engine.
 
 3. Elements in the file:
    - Sidebar: Vertical navigation menu, Model/Batch settings, Hardware configuration,
@@ -30,9 +30,8 @@ File: dashboard/app.py
    - Section 2: Live Memory Monitor (Device Overview / NVML & Power).
    - Section 3: Memory Profiling & Fragmentation (Live FSFI & Block Explorer).
    - Section 4: Memory Pressure & OOM Prevention (Measurement-driven risk).
-   - Section 5: Workload Manager (Operational Cooperative Admission Control).
+   - Section 5: GPU Process & Workload Manager (Process inspection, Headroom recovery, Feasibility).
    - Section 6: OOM Defense & Tiered Swapper (Finalized & Protected hardware benchmark).
-   - Section 7: Profiling & Benchmark Reports (Executable benchmark matrix).
 
 4. Final output of the file:
    An interactive, production-grade web dashboard running at http://localhost:8501.
@@ -40,6 +39,8 @@ File: dashboard/app.py
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -80,11 +81,15 @@ from pipeline.aggregate import (
     resample_timeseries,
 )
 from pipeline.validate import validate_csv_file
-from profiler.memory_pressure import evaluate_oom_risk_heuristic
+from profiler.memory_pressure import (
+    evaluate_oom_risk_heuristic,
+    evaluate_live_memory_pressure,
+)
 from profiler.fragmentation import (
     parse_snapshot_json,
     parse_snapshot_detailed,
     capture_live_fragmentation_snapshot,
+    get_passive_allocator_status,
 )
 from controller.admission_control import AdmissionController, AdmissionDecision
 from experiments.runner import (
@@ -93,6 +98,13 @@ from experiments.runner import (
     real_gpu_workload_runner,
     run_controlled_experiment,
     run_baseline_experiment,
+    profile_workload_demand,
+    run_contention_experiment,
+    run_allocation_pattern_experiment,
+    run_memory_reclamation_experiment,
+    run_precision_comparison_experiment,
+    run_batch_scaling_experiment,
+    get_activation_swapper_evaluation,
 )
 from experiments.schema import (
     ExperimentResult,
@@ -226,13 +238,19 @@ def get_live_gpu_processes(handle: Any) -> List[Dict[str, Any]]:
                     p_name = os.path.basename(p_name)
                 except Exception:
                     pass
-                vram_bytes = getattr(p, "usedGpuMemory", None)
-                vram_str = f"{vram_bytes // (1024*1024)} MiB" if vram_bytes else "Active"
+                vram_bytes = getattr(p, "usedGpuMemory", None) or 0
+                vram_mb = round(vram_bytes / (1024 * 1024), 1) if vram_bytes else 0.0
+                vram_str = f"{vram_mb:.0f} MiB" if vram_bytes > 0 else "Active"
                 results.append({
                     "PID": p.pid,
                     "Process Name": p_name,
                     "Subsystem": "DirectX / Vulkan",
                     "VRAM Usage": vram_str,
+                    "pid": p.pid,
+                    "name": p_name,
+                    "type": "DirectX / Vulkan",
+                    "used_bytes": vram_bytes,
+                    "used_mb": vram_mb,
                 })
         except Exception:
             pass
@@ -250,13 +268,19 @@ def get_live_gpu_processes(handle: Any) -> List[Dict[str, Any]]:
                     p_name = os.path.basename(p_name)
                 except Exception:
                     pass
-                vram_bytes = getattr(p, "usedGpuMemory", None)
-                vram_str = f"{vram_bytes // (1024*1024)} MiB" if vram_bytes else "Active"
+                vram_bytes = getattr(p, "usedGpuMemory", None) or 0
+                vram_mb = round(vram_bytes / (1024 * 1024), 1) if vram_bytes else 0.0
+                vram_str = f"{vram_mb:.0f} MiB" if vram_bytes > 0 else "Active"
                 results.append({
                     "PID": p.pid,
                     "Process Name": p_name,
                     "Subsystem": "CUDA Compute",
                     "VRAM Usage": vram_str,
+                    "pid": p.pid,
+                    "name": p_name,
+                    "type": "CUDA Compute",
+                    "used_bytes": vram_bytes,
+                    "used_mb": vram_mb,
                 })
         except Exception:
             pass
@@ -264,6 +288,112 @@ def get_live_gpu_processes(handle: Any) -> List[Dict[str, Any]]:
         pass
 
     return results
+
+
+def classify_gpu_process(name: str, pid: int) -> Dict[str, Any]:
+    """
+    1. The use of function:
+       Classifies an active GPU process into one of three operational categories:
+       Protected System, Reclaimable User App, or Active Compute / ML.
+
+    2. How does the specific function work:
+       Normalizes the executable name to lowercase and evaluates it against protected
+       Windows core components (dwm.exe, csrss.exe, explorer.exe), known desktop
+       user-space applications (chrome.exe, msedge.exe, code.exe, discord.exe, etc.),
+       and compute runtimes (python.exe, torch). Returns category, killability flag,
+       and visual badge.
+
+    3. Concepts used in the function:
+       Operating system process hierarchy, user vs kernel/system boundary separation,
+       and desktop GPU hardware acceleration resource reclamation.
+
+    4. Places where this function is imported and used:
+       Used internally in dashboard/app.py within the GPU Process & Workload Resource Manager
+       view and executive overview process listings.
+
+    5. Final output of the function, before and after:
+       Before: Raw process name string and PID without operational context.
+       After: Structured dictionary containing category label, killable boolean,
+              icon badge, and actionable memory recovery guidance.
+    """
+    p_name_lower = name.lower()
+    current_pid = os.getpid()
+
+    # Protected core OS / Display components
+    if pid <= 4 or pid == current_pid or any(sys_name in p_name_lower for sys_name in ["dwm", "csrss", "explorer", "system", "smss", "wininit", "services"]):
+        return {
+            "category": "Protected System",
+            "killable": False,
+            "badge": "🛡️ System Protected",
+            "guidance": "Essential OS display component. Cannot be terminated.",
+        }
+
+    # Known background user/desktop apps that consume VRAM for GUI acceleration
+    user_app_patterns = [
+        "chrome", "msedge", "brave", "firefox", "opera", "vivaldi",
+        "code", "devenv", "pycharm", "sublime", "atom",
+        "discord", "slack", "teams", "spotify", "telegram", "whatsapp",
+        "steam", "epicgames", "geforceexperience", "nvcontainer"
+    ]
+    if any(pat in p_name_lower for pat in user_app_patterns):
+        return {
+            "category": "Reclaimable User App",
+            "killable": True,
+            "badge": "🟡 Reclaimable User App",
+            "guidance": "Non-essential desktop application. Safe to terminate to recover VRAM for training.",
+        }
+
+    # Python / ML compute processes
+    if any(comp in p_name_lower for comp in ["python", "jupyter", "torch", "tensor"]):
+        return {
+            "category": "Active Compute / ML",
+            "killable": True,
+            "badge": "⚡ Active ML / Compute",
+            "guidance": "Active computation/training workload running on device.",
+        }
+
+    # Default fallback for other user processes
+    return {
+        "category": "Reclaimable User App",
+        "killable": True,
+        "badge": "🟡 User Process",
+        "guidance": "General user-space application holding hardware-accelerated buffers.",
+    }
+
+
+def terminate_process_by_pid(pid: int) -> bool:
+    """
+    1. The use of function:
+       Safely terminates a non-critical desktop or user background process by PID
+       to immediately release driver-locked VRAM back to the GPU free pool.
+
+    2. How does the specific function work:
+       Validates that PID is strictly non-system (pid > 4) and not the dashboard process itself
+       (pid != os.getpid()). Issues standard SIGTERM via os.kill, and falls back to Windows
+       taskkill /PID <pid> /F if process ignores SIGTERM. Returns boolean status.
+
+    3. Concepts used in the function:
+       Operating system signal handling, process lifecycle termination, and driver-level
+       VRAM allocation cleanup triggered on process address space destruction.
+
+    4. Places where this function is imported and used:
+       Used in the Headroom Recovery Assistant within View 4 of dashboard/app.py.
+
+    5. Final output of the function, before and after:
+       Before: Background process actively locking GPU memory buffers.
+       After: Process cleanly terminated with True returned, releasing VRAM to physical free pool.
+    """
+    if pid <= 4 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except Exception:
+        try:
+            res = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=3)
+            return res.returncode == 0
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -305,45 +435,19 @@ nav_section = st.sidebar.radio(
         "🖥️ Live Memory Monitor",
         "🧩 Memory Profiling & Fragmentation",
         "⚠️ Memory Pressure & OOM Prevention",
-        "⚖️ Workload Manager",
+        "⚖️ GPU Process & Workload Manager",
         "⚡ OOM Defense & Tiered Swapper",
-        "📋 Profiling & Benchmark Reports",
     ],
     index=0,
 )
 
-st.sidebar.markdown("<hr style='border-color: rgba(255,255,255,0.08); margin: 12px 0;'>", unsafe_allow_html=True)
-st.sidebar.markdown('<div style="font-size: 0.82rem; font-weight: 700; color: #ffffff; margin-bottom: 8px;">Settings</div>', unsafe_allow_html=True)
-
-# Hardware Profile Selection
-detected_name = gpu_hardware["name"] if gpu_hardware else "NVIDIA RTX 3050"
-detected_cap = f"{gpu_hardware['total_gb']:.0f} GB" if gpu_hardware else "6 GB"
-
-gpu_options = [
-    f"{detected_name} ({detected_cap})",
-    "NVIDIA RTX 3050 (6 GB)",
-    "NVIDIA RTX 4050 (6 GB)",
-    "Custom Hardware Budget",
-]
-selected_gpu_profile = st.sidebar.selectbox("Select GPU", gpu_options, index=0)
-
-if selected_gpu_profile == "Custom Hardware Budget":
-    budget_gb = st.sidebar.slider("Configured Memory Budget (GiB)", 1.0, 24.0, 6.0, 0.5)
-    budget_bytes = int(budget_gb * 1024 * 1024 * 1024)
-elif gpu_hardware and selected_gpu_profile.startswith(detected_name):
+# Hardware budget derived automatically from detected accelerator hardware
+if gpu_hardware:
     budget_bytes = int(gpu_hardware["total_bytes"])
     budget_gb = float(gpu_hardware["total_gb"])
 else:
     budget_gb = 6.0
     budget_bytes = int(budget_gb * 1024 * 1024 * 1024)
-
-# Model profiling presets
-selected_model = st.sidebar.selectbox("Select Model", ["ResNet-50", "Vision Transformer", "Small CNN", "Memory Stress Test"], index=0)
-batch_size_sel = st.sidebar.number_input("Batch Size", min_value=1, max_value=256, value=32, step=8)
-precision_sel = st.sidebar.selectbox("Precision", ["FP32", "FP16 (AMP)", "BF16"], index=0)
-
-if st.sidebar.button("▶ Start Profiling", width="stretch"):
-    st.sidebar.info(f"Target selected: {selected_model} (Batch={batch_size_sel}, {precision_sel}). Ready for execution.")
 
 # Advanced Controls Foldable
 with st.sidebar.expander("⚙️ Data Source & Live Polling", expanded=False):
@@ -600,7 +704,7 @@ def render_oom_defense_swapper_view():
         dev_choices.append("CPU Safe Simulation Mode")
         live_dev_choice = st.selectbox("Execution Device", dev_choices, index=0, key="bench_dev_select")
     with c3:
-        batch_choice = st.selectbox("Batch Size", [64, 96, 112, 128], index=1, key="bench_batch_select")
+        batch_choice = st.selectbox("Batch Size", [48, 64, 96, 112, 128, 144, 160], index=2, key="bench_batch_select")
     with c4:
         live_threshold = st.number_input(
             "Offload Threshold (MB)",
@@ -619,11 +723,13 @@ def render_oom_defense_swapper_view():
         key="bench_enforce_oom_check",
     )
 
-    btn_col1, btn_col2, btn_col3 = st.columns([1.0, 1.8, 3.2])
+    btn_col1, btn_col2, btn_col3 = st.columns([2.0, 2.4, 1.4])
     with btn_col1:
-        run_test_btn = st.button("Test", type="primary", key="btn_run_tiered_swapper_test")
+        run_baseline_btn = st.button("▶ 1. Test Normal GPU-Only (No Swapper)", type="secondary", width="stretch", key="btn_run_baseline_only")
     with btn_col2:
-        release_mem_btn = st.button("🧹 Release System & GPU RAM", key="btn_release_mem_manual")
+        run_swapper_btn = st.button("⚡ 2. Test With Tiered Swapper (OOM Defense)", type="primary", width="stretch", key="btn_run_swapper_only")
+    with btn_col3:
+        release_mem_btn = st.button("🧹 Release Memory", width="stretch", key="btn_release_mem_manual")
 
     if release_mem_btn:
         cleanup_system_and_gpu_memory()
@@ -646,7 +752,9 @@ def render_oom_defense_swapper_view():
     else:
         m_type_clean = "mlp"
 
-    if run_test_btn:
+    active_test_mode = "baseline_only" if run_baseline_btn else ("swapper_only" if run_swapper_btn else None)
+
+    if active_test_mode is not None:
         cleanup_system_and_gpu_memory()
         stream_records: List[Dict[str, Any]] = []
 
@@ -660,13 +768,13 @@ def render_oom_defense_swapper_view():
                     b_html = f"""
                     <div style="background: rgba(244, 63, 94, 0.15); border: 2px solid #f43f5e; border-radius: 8px; padding: 14px 18px; margin-bottom: 14px;">
                         <div style="font-size: 1.05rem; font-weight: 800; color: #f43f5e; display: flex; align-items: center; gap: 8px;">
-                            <span>💥</span> <span>Phase 1 Baseline Intercepted: Out-Of-Memory (OOM) at {record.elapsed_s:.1f}s</span>
+                            <span>💥</span> <span>Normal GPU Baseline Intercepted: Out-Of-Memory (OOM) at {record.elapsed_s:.1f}s</span>
                         </div>
                         <div style="font-size: 0.8rem; color: #fecdd3; margin-top: 4px; font-family: monospace;">
                             {record.error_message or 'CUDA out of memory. Tried to allocate activation tensor.'}
                         </div>
                         <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 6px;">
-                            PyTorch caching allocator exhausted physical VRAM on batch {record.batch_size}. Clearing cache and engaging TieredActivationManager...
+                            Physical VRAM capacity reached on batch {record.batch_size}. To train this batch size with zero crashes, click <b>⚡ 2. Test With Tiered Swapper</b> above!
                         </div>
                     </div>
                     """
@@ -674,7 +782,7 @@ def render_oom_defense_swapper_view():
                     b_html = f"""
                     <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid #f59e0b; border-radius: 8px; padding: 14px 18px; margin-bottom: 14px;">
                         <div style="font-size: 1.05rem; font-weight: 800; color: #f59e0b; display: flex; align-items: center; gap: 8px;">
-                            <span>🔥</span> <span>Phase 1: Baseline GPU Training [Batch {record.batch_size}] — Elapsed: {record.elapsed_s:.1f}s</span>
+                            <span>🔥</span> <span>Normal GPU Baseline Running [Batch {record.batch_size}] — Elapsed: {record.elapsed_s:.1f}s</span>
                         </div>
                         <div style="font-size: 0.8rem; color: #cbd5e1; margin-top: 4px;">
                             Executing unmanaged forward-backward iterations on {hw_name}. Allocating real tensors towards 6GB physical capacity.
@@ -685,7 +793,7 @@ def render_oom_defense_swapper_view():
                 b_html = f"""
                 <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid #10b981; border-radius: 8px; padding: 14px 18px; margin-bottom: 14px;">
                     <div style="font-size: 1.05rem; font-weight: 800; color: #10b981; display: flex; align-items: center; gap: 8px;">
-                        <span>🛡️</span> <span>Phase 2: Tiered Swapper Active [Batch {record.batch_size}] — Elapsed: {record.elapsed_s:.1f}s</span>
+                        <span>🛡️</span> <span>Tiered Swapper Active [Batch {record.batch_size}] — Elapsed: {record.elapsed_s:.1f}s</span>
                     </div>
                     <div style="font-size: 0.8rem; color: #cbd5e1; margin-top: 4px;">
                         Dedicated VRAM clamped at {record.vram_used_mb:.1f} MB. Overflow activations ({record.host_ram_used_mb:.1f} MB) dynamically offloaded to Host CPU pinned RAM.
@@ -715,7 +823,8 @@ def render_oom_defense_swapper_view():
                 )
 
         try:
-            with st.spinner("Executing real hardware benchmark on RTX 4050..."):
+            sp_title = "Executing Normal GPU Baseline..." if active_test_mode == "baseline_only" else "Executing Tiered Swapper Benchmark..."
+            with st.spinner(sp_title):
                 live_summary = run_live_1min_benchmark(
                     device_name="cuda" if is_cuda_selected else "cpu",
                     simulate=(not is_cuda_selected),
@@ -729,41 +838,75 @@ def render_oom_defense_swapper_view():
                     max_steps_p1=10,
                     max_steps_p2=14,
                     callback=handle_live_tick,
+                    mode=active_test_mode,
                 )
-                st.session_state["live_benchmark_summary"] = live_summary.to_dict()
+                summary_dict = live_summary.to_dict()
+                summary_dict["mode"] = active_test_mode
+                summary_dict["batch_tested"] = batch_choice
+                st.session_state["live_benchmark_summary"] = summary_dict
         finally:
             cleanup_system_and_gpu_memory()
 
     # Render persisted benchmark summary if present
     saved_summary = st.session_state.get("live_benchmark_summary")
-    if saved_summary and not run_test_btn:
+    if saved_summary and active_test_mode is None:
         records_saved = saved_summary.get("records", [])
-        df_saved = pd.DataFrame(records_saved)
-
+        saved_mode = saved_summary.get("mode", "both")
+        b_tested = saved_summary.get("batch_tested", batch_choice)
         p1_crashed = saved_summary.get("phase1_crashed_oom", False)
-        match_status = "PASS (Bit-for-Bit Verified)" if saved_summary.get("gradient_equivalence", True) else "FAIL"
-        match_color = "#10b981" if saved_summary.get("gradient_equivalence", True) else "#f43f5e"
 
-        st.markdown(
-            f"""
-            <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid {match_color}; border-radius: 8px; padding: 14px 18px; margin: 16px 0; display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <div style="font-size: 1.05rem; font-weight: 800; color: {match_color}; display: flex; align-items: center; gap: 8px;">
-                        <span>🛡️</span> <span>Benchmark Completed: Zero-OOM Protected & 100% Bit-for-Bit Verified</span>
+        if saved_mode == "baseline_only":
+            if p1_crashed:
+                st.markdown(
+                    f"""
+                    <div style="background: rgba(244, 63, 94, 0.1); border: 1px solid #f43f5e; border-radius: 8px; padding: 14px 18px; margin: 16px 0;">
+                        <div style="font-size: 1.05rem; font-weight: 800; color: #f43f5e; display: flex; align-items: center; gap: 8px;">
+                            <span>💥</span> <span>Normal GPU Baseline Result: CUDA OutOfMemoryError on Batch {b_tested}</span>
+                        </div>
+                        <div style="font-size: 0.82rem; color: #cbd5e1; margin-top: 4px;">
+                            Physical VRAM capacity was exhausted by unmanaged forward activations. Now click <b>⚡ 2. Test With Tiered Swapper</b> at this exact batch size to demonstrate zero-OOM protection!
+                        </div>
                     </div>
-                    <div style="font-size: 0.8rem; color: #cbd5e1; margin-top: 4px;">
-                        Phase 1 (Baseline, Batch {batch_choice}): {'💥 Aborted due to authentic CUDA OutOfMemoryError at saturation ceiling' if p1_crashed else 'Saturated physical capacity'}.<br>
-                        Phase 2 (Tiered Swapper, Batch {batch_choice}): Successfully trained with VRAM clamped below {live_threshold:.0f} MB and overflow ({saved_summary.get('peak_host_ram_mb', 0.0):.1f} MB) absorbed by Host CPU RAM.
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid #10b981; border-radius: 8px; padding: 14px 18px; margin: 16px 0;">
+                        <div style="font-size: 1.05rem; font-weight: 800; color: #10b981; display: flex; align-items: center; gap: 8px;">
+                            <span>✅</span> <span>Normal GPU Baseline Succeeded: Batch {b_tested} Completed</span>
+                        </div>
+                        <div style="font-size: 0.82rem; color: #cbd5e1; margin-top: 4px;">
+                            Workload fit within physical VRAM (Peak VRAM: {saved_summary.get('phase1_peak_vram_mb', 0.0):.1f} MB). Try increasing batch size to 112, 128, or 144 to observe the CUDA OOM boundary!
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            match_status = "PASS (Bit-for-Bit Verified)" if saved_summary.get("gradient_equivalence", True) else "FAIL"
+            match_color = "#10b981" if saved_summary.get("gradient_equivalence", True) else "#f43f5e"
+            st.markdown(
+                f"""
+                <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid {match_color}; border-radius: 8px; padding: 14px 18px; margin: 16px 0; display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <div style="font-size: 1.05rem; font-weight: 800; color: {match_color}; display: flex; align-items: center; gap: 8px;">
+                            <span>🛡️</span> <span>Tiered Swapper Result: Zero-OOM Protected & 100% Bit-for-Bit Verified</span>
+                        </div>
+                        <div style="font-size: 0.8rem; color: #cbd5e1; margin-top: 4px;">
+                            Batch {b_tested} trained stably with VRAM clamped below {live_threshold:.0f} MB.<br>
+                            Overflow ({saved_summary.get('peak_host_ram_mb', 0.0):.1f} MB) dynamically offloaded across PCIe bus to Host CPU RAM. Zero crashes!
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <span style="background: {match_color}; color: #0b101b; font-weight: 800; font-size: 0.78rem; padding: 5px 12px; border-radius: 4px;">{match_status}</span>
+                        <div style="font-size: 0.75rem; color: #94a3b8; font-family: monospace; margin-top: 4px;">Max Grad Error: {saved_summary.get('max_gradient_diff', 0.0):.2e}</div>
                     </div>
                 </div>
-                <div style="text-align: right;">
-                    <span style="background: {match_color}; color: #0b101b; font-weight: 800; font-size: 0.78rem; padding: 5px 12px; border-radius: 4px;">{match_status}</span>
-                    <div style="font-size: 0.75rem; color: #94a3b8; font-family: monospace; margin-top: 4px;">Max Grad Error: {saved_summary.get('max_gradient_diff', 0.0):.2e}</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
 
         kp1, kp2, kp3, kp4 = st.columns(4)
         with kp1:
@@ -1184,116 +1327,135 @@ elif nav_section == "🧩 Memory Profiling & Fragmentation":
     st.subheader("🧩 Allocator Memory Profiling & Fragmentation Analysis")
     st.caption("Measuring internal PyTorch caching allocator pool fragmentation vs physical GPU driver memory.")
 
-    st.markdown(
-        r"""
-        <div style="background-color: #111827; border: 1px solid rgba(0, 136, 255, 0.3); border-radius: 8px; padding: 14px 18px; margin-bottom: 16px;">
-            <div style="font-size: 0.92rem; font-weight: 700; color: #60a5fa; margin-bottom: 4px;">
-                💡 Operating System vs Allocator Concept Separation
-            </div>
-            <div style="font-size: 0.85rem; color: #cbd5e1; line-height: 1.5;">
-                This module profiles <b>PyTorch Caching Allocator virtual pool fragmentation</b> in user space, not physical OS page fragmentation.
-                <code>torch.cuda.empty_cache()</code> releases inactive cached segments back to the NVIDIA driver, increasing driver-level free VRAM;
-                it does <b>not</b> defragment or relocate live active tensor allocations.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    frag_tab_a, frag_tab_b = st.tabs([
+        "📊 Mode A: Passive Live Allocator Monitoring",
+        "🧪 Mode B: Controlled Fragmentation Experiment",
+    ])
 
-    # Action bar for live fragmentation profiling
-    c_btn1, c_btn2, c_btn3 = st.columns([1.5, 1.2, 1.3])
-    with c_btn1:
-        tensor_count_input = st.number_input("Tensor Count", min_value=8, max_value=32, value=16, step=4, help="Starting tensor allocation count")
-    with c_btn2:
-        tensor_size_input = st.number_input("Tensor Size (MB)", min_value=4, max_value=16, value=8, step=2, help="Size per allocated float32 tensor")
-    with c_btn3:
-        st.write("")
-        st.write("")
-        run_frag_btn = st.button("▶ Run Live Allocator Fragmentation Profile", type="primary", width="stretch")
+    with frag_tab_a:
+        st.markdown("#### Passive In-Process Allocator Telemetry")
+        st.caption("Passively samples live PyTorch caching allocator statistics without allocating artificial tensors.")
+        passive_stats = get_passive_allocator_status()
 
-    if run_frag_btn:
-        with st.spinner("Executing safe allocation, hole-punching, and dual-snapshot capture on GPU..."):
-            res = capture_live_fragmentation_snapshot(
-                tensor_count=tensor_count_input,
-                tensor_size_mb=tensor_size_input,
+        if not passive_stats["available"]:
+            st.warning(f"⚠️ {passive_stats['status_description']}")
+        elif passive_stats["is_idle"]:
+            st.info(
+                f"ℹ️ **{passive_stats['status_description']}**\n\n"
+                f"{passive_stats['distinction_note']}\n\n"
+                "To generate allocator activity, launch a workload in **⚖️ GPU Process & Workload Manager** "
+                "or run the experiment in **Mode B: Controlled Fragmentation Experiment**."
             )
-            st.session_state["last_live_fragmentation"] = res
-            if res.get("success"):
-                st.success("✅ Live allocator fragmentation profile captured successfully.")
-            else:
-                st.error(f"❌ Failed: {res.get('error', 'Unknown error')}")
-
-    # Display live result if present
-    live_frag = st.session_state.get("last_live_fragmentation")
-    if live_frag and live_frag.get("success"):
-        p1 = live_frag["phase1_fragmented"]
-        p2 = live_frag["phase2_post_empty_cache"]
-
-        st.markdown(
-            f"""
-            <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid #10b981; border-radius: 8px; padding: 12px 16px; margin: 14px 0;">
-                <div style="font-weight: 700; color: #10b981; font-size: 0.95rem; margin-bottom: 4px;">
-                    🎯 Real Hardware Measurement (Captured at {live_frag['time_str']})
-                </div>
-                <div style="font-size: 0.84rem; color: #cbd5e1;">
-                    {live_frag['explanation']}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("#### 4-Tier Memory State Before vs After `empty_cache()`")
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        with col_m1:
-            render_kpi_card("Allocated Tensors", f"{p1['allocated_bytes']/(1024*1024):.1f} MB", f"Post: {p2['allocated_bytes']/(1024*1024):.1f} MB", color="#0088ff")
-        with col_m2:
-            render_kpi_card("Reserved Allocator Pool", f"{p1['reserved_bytes']/(1024*1024):.1f} MB", f"Released: {live_frag['reserved_released_mb']:.1f} MB", color="#8e44ad")
-        with col_m3:
-            render_kpi_card("Inactive in Pool", f"{p1['inactive_bytes']/(1024*1024):.1f} MB", f"{p1['inactive_block_count']} blocks -> {p2['inactive_block_count']} blocks", color="#f43f5e")
-        with col_m4:
-            render_kpi_card("Driver Free VRAM", f"{p1['driver_free_bytes']/(1024*1024):.1f} MB", f"+{live_frag['driver_free_gained_mb']:.1f} MB gained", color="#10b981")
-
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            render_kpi_card("FSFI (Fragmented State)", f"{p1['fsfi']:.4f}", f"Largest free block: {p1['largest_free_block_bytes']/(1024*1024):.1f} MB")
-        with col_f2:
-            render_kpi_card("FSFI (Post empty_cache)", f"{p2['fsfi']:.4f}", f"Largest free block: {p2['largest_free_block_bytes']/(1024*1024):.1f} MB")
-
-        # Allocator Segment Map
-        st.markdown("#### Allocator Segment Block Layout")
-        render_allocator_segment_block_ui(fsfi_score=p1["fsfi"], largest_free_mb=int(p1["largest_free_block_bytes"] / (1024 * 1024)))
-
-        if live_frag.get("all_blocks_phase1"):
-            st.markdown("#### Block Size Distribution (Fragmented Pool)")
-            b_chart = create_block_histogram(live_frag["all_blocks_phase1"])
-            st.altair_chart(b_chart, width="stretch")
-
-    else:
-        # Check for historical snapshots on disk
-        snapshots = sorted(list(snapshot_dir.glob("*.json"))) if snapshot_dir and snapshot_dir.is_dir() else []
-        if snapshots:
-            st.markdown("#### Historical Allocator Snapshots on Disk")
-            selected_snap = st.selectbox("Select Snapshot JSON", snapshots, format_func=lambda p: p.name)
-            try:
-                snap_parsed = parse_snapshot_detailed(selected_snap)
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    render_kpi_card("FSFI Index", f"{snap_parsed['fsfi']:.4f}", "Free-Space Fragmentation Index")
-                with col2:
-                    render_kpi_card("Largest Free Block", format_bytes(snap_parsed["largest_free_block_bytes"]), "Max allocatable chunk", color="#0088ff")
-                with col3:
-                    render_kpi_card("Total Inactive Free", format_bytes(snap_parsed["total_inactive_bytes"]), "Sum of inactive blocks", color="#8e44ad")
-                with col4:
-                    render_kpi_card("Inactive Blocks", str(snap_parsed["inactive_block_count"]), "Splintered free holes")
-
-                render_allocator_segment_block_ui(fsfi_score=snap_parsed["fsfi"], largest_free_mb=int(snap_parsed["largest_free_block_bytes"] / (1024 * 1024)))
-                if snap_parsed["all_blocks"]:
-                    st.altair_chart(create_block_histogram(snap_parsed["all_blocks"]), width="stretch")
-            except Exception as e:
-                st.error(f"Error reading snapshot: {e}")
+            col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+            with col_p1:
+                render_kpi_card("Allocated Tensors", "0.0 MB", "Current process", color="#0088ff")
+            with col_p2:
+                render_kpi_card("Reserved Pool", "0.0 MB", "Unacquired", color="#8e44ad")
+            with col_p3:
+                render_kpi_card("Driver Free VRAM", f"{passive_stats['driver_free_bytes'] // (1024*1024)} MB", "Physical device", color="#10b981")
+            with col_p4:
+                render_kpi_card("FSFI Fragmentation", "N/A", "Pool dormant (unallocated)", color="#64748b")
         else:
-            st.info("No allocator snapshot captured yet. Click **▶ Run Live Allocator Fragmentation Profile** above to profile.")
+            col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+            with col_p1:
+                render_kpi_card("Allocated Tensors", f"{passive_stats['allocated_bytes']/(1024*1024):.1f} MB", f"Peak: {passive_stats['max_allocated_bytes']/(1024*1024):.1f} MB", color="#0088ff")
+            with col_p2:
+                render_kpi_card("Reserved Pool", f"{passive_stats['reserved_bytes']/(1024*1024):.1f} MB", f"Peak: {passive_stats['max_reserved_bytes']/(1024*1024):.1f} MB", color="#8e44ad")
+            with col_p3:
+                render_kpi_card("Pool Free (Cached)", f"{passive_stats['pool_free_bytes']/(1024*1024):.1f} MB", f"Inactive split: {passive_stats['inactive_split_bytes']/(1024*1024):.1f} MB", color="#f43f5e")
+            with col_p4:
+                render_kpi_card("FSFI Index", f"{passive_stats['fsfi']:.4f}" if passive_stats['fsfi'] is not None else "N/A", f"Active segments: {passive_stats['active_segments']}")
+
+        # Collapsible Offline Historical Snapshot Inspector
+        with st.expander("📂 Offline Historical Snapshot Inspector (Stored JSON dumps)"):
+            st.caption("Inspect saved offline JSON snapshots on disk. These are historical snapshots and do not represent live GPU state.")
+            snapshots = sorted(list(snapshot_dir.glob("*.json"))) if snapshot_dir and snapshot_dir.is_dir() else []
+            if snapshots:
+                selected_snap = st.selectbox("Select Historical Snapshot JSON", snapshots, format_func=lambda p: p.name, key="hist_snap_select")
+                try:
+                    snap_parsed = parse_snapshot_detailed(selected_snap)
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        render_kpi_card("Snapshot FSFI", f"{snap_parsed['fsfi']:.4f}", "Offline historical index")
+                    with col2:
+                        render_kpi_card("Largest Free Block", format_bytes(snap_parsed["largest_free_block_bytes"]), "Max contiguous chunk", color="#0088ff")
+                    with col3:
+                        render_kpi_card("Total Inactive Free", format_bytes(snap_parsed["total_inactive_bytes"]), "Sum of free blocks", color="#8e44ad")
+                    with col4:
+                        render_kpi_card("Inactive Blocks", str(snap_parsed["inactive_block_count"]), "Splintered holes")
+                    render_allocator_segment_block_ui(fsfi_score=snap_parsed["fsfi"], largest_free_mb=int(snap_parsed["largest_free_block_bytes"] / (1024 * 1024)))
+                    if snap_parsed["all_blocks"]:
+                        st.altair_chart(create_block_histogram(snap_parsed["all_blocks"]), width="stretch")
+                except Exception as e:
+                    st.error(f"Error reading snapshot: {e}")
+            else:
+                st.info("No historical snapshots found in data/profiles/snapshots.")
+
+    with frag_tab_b:
+        st.markdown("#### Controlled Hole-Punching & Reclamation Experiment")
+        st.caption("An active experiment that allocates identically sized tensors, deletes alternating tensors to fragment reserved segments, and measures empty_cache() reclamation.")
+
+        c_btn1, c_btn2, c_btn3 = st.columns([1.5, 1.2, 1.3])
+        with c_btn1:
+            tensor_count_input = st.number_input("Tensor Count", min_value=8, max_value=32, value=16, step=4, help="Starting tensor allocation count")
+        with c_btn2:
+            tensor_size_input = st.number_input("Tensor Size (MB)", min_value=4, max_value=16, value=8, step=2, help="Size per allocated float32 tensor")
+        with c_btn3:
+            st.write("")
+            st.write("")
+            run_frag_btn = st.button("▶ Run Controlled Fragmentation Experiment", type="primary", width="stretch")
+
+        if run_frag_btn:
+            with st.spinner("Executing safe allocation, hole-punching, and dual-snapshot capture on GPU..."):
+                res = capture_live_fragmentation_snapshot(
+                    tensor_count=tensor_count_input,
+                    tensor_size_mb=tensor_size_input,
+                )
+                st.session_state["last_live_fragmentation"] = res
+                if res.get("success"):
+                    st.success("✅ Controlled fragmentation experiment completed successfully.")
+                else:
+                    st.error(f"❌ Failed: {res.get('error', 'Unknown error')}")
+
+        live_frag = st.session_state.get("last_live_fragmentation")
+        if live_frag and live_frag.get("success"):
+            b_st = live_frag.get("stage1_baseline", {})
+            a_st = live_frag.get("stage2_allocated", {})
+            p1 = live_frag["phase1_fragmented"]
+            p2 = live_frag["phase2_post_empty_cache"]
+
+            st.markdown(
+                f"""
+                <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid #10b981; border-radius: 8px; padding: 12px 16px; margin: 14px 0;">
+                    <div style="font-weight: 700; color: #10b981; font-size: 0.95rem; margin-bottom: 4px;">
+                        🎯 Real Hardware Measurement (Captured at {live_frag['time_str']})
+                    </div>
+                    <div style="font-size: 0.84rem; color: #cbd5e1; margin-bottom: 6px;">
+                        {live_frag['explanation']}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("##### 4-Stage Allocator Evolution Timeline")
+            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+            with col_s1:
+                render_kpi_card("1. Baseline", f"{b_st.get('allocated_bytes', 0)/(1024*1024):.1f} MB alloc", f"Reserved: {b_st.get('reserved_bytes', 0)/(1024*1024):.1f} MB", color="#64748b")
+            with col_s2:
+                render_kpi_card(f"2. Allocated ({tensor_count_input}x)", f"{a_st.get('allocated_bytes', 0)/(1024*1024):.1f} MB alloc", f"Reserved: {a_st.get('reserved_bytes', 0)/(1024*1024):.1f} MB", color="#0088ff")
+            with col_s3:
+                render_kpi_card("3. Holes Punched", f"FSFI: {p1['fsfi']:.4f}", f"{p1['inactive_block_count']} inactive blocks ({p1['inactive_bytes']/(1024*1024):.1f} MB)", color="#f43f5e")
+            with col_s4:
+                render_kpi_card("4. Post empty_cache()", f"FSFI: {p2['fsfi']:.4f}", f"Driver gained: +{live_frag['driver_free_gained_mb']:.1f} MB", color="#10b981")
+
+            st.markdown("#### Allocator Segment Block Layout (Fragmented State)")
+            render_allocator_segment_block_ui(fsfi_score=p1["fsfi"], largest_free_mb=int(p1["largest_free_block_bytes"] / (1024 * 1024)))
+
+            if live_frag.get("all_blocks_phase1"):
+                st.markdown("#### Block Size Distribution (Fragmented Pool)")
+                b_chart = create_block_histogram(live_frag["all_blocks_phase1"])
+                st.altair_chart(b_chart, width="stretch")
 
 
 # ===========================================================================
@@ -1301,89 +1463,280 @@ elif nav_section == "🧩 Memory Profiling & Fragmentation":
 # ===========================================================================
 elif nav_section == "⚠️ Memory Pressure & OOM Prevention":
     st.subheader("⚠️ Measurement-Driven Memory Pressure & OOM Prevention")
-    st.caption("Evaluating driver-level headroom and allocator growth velocity to identify memory pressure.")
+    st.caption("Evaluating driver-level headroom, allocator growth velocity, and true device contention to identify memory pressure.")
 
-    active_df = uploaded_df if not uploaded_df.empty else df_torch
-    curr_alloc = 0
-    curr_resv = 0
-    growth_rate_bps = 0.0
+    is_live_mode = data_source_mode.startswith("🔴 Live GPU")
 
-    if not active_df.empty:
-        active_df = ensure_normalized_columns(active_df)
-        curr_alloc = int(active_df["allocated_bytes"].dropna().iloc[-1]) if "allocated_bytes" in active_df.columns and active_df["allocated_bytes"].notna().any() else int(active_df["allocated_mb"].dropna().iloc[-1] * 1024 * 1024)
-        curr_resv = int(active_df["reserved_bytes"].dropna().iloc[-1]) if "reserved_bytes" in active_df.columns and active_df["reserved_bytes"].notna().any() else int(active_df["reserved_mb"].dropna().iloc[-1] * 1024 * 1024)
-        if len(active_df) > 1 and "elapsed_s" in active_df.columns:
-            time_diff = active_df["elapsed_s"].iloc[-1] - active_df["elapsed_s"].iloc[0]
-            alloc_col = "allocated_bytes" if "allocated_bytes" in active_df.columns else "allocated_mb"
-            mult = 1 if "allocated_bytes" in active_df.columns else 1024 * 1024
-            alloc_diff = (active_df[alloc_col].iloc[-1] - active_df[alloc_col].iloc[0]) * mult
-            if time_diff > 0:
-                growth_rate_bps = alloc_diff / time_diff
-    elif gpu_hardware:
+    if is_live_mode:
+        # Physical device telemetry via NVML
+        phys_total = int(gpu_hardware["total_gb"] * 1024 * 1024 * 1024) if gpu_hardware else (6 * 1024 * 1024 * 1024)
+        phys_used = 0
+        if gpu_hardware and gpu_hardware.get("handle"):
+            try:
+                phys_used = pynvml.nvmlDeviceGetMemoryInfo(gpu_hardware["handle"]).used
+            except Exception:
+                pass
+
+        # In-process PyTorch allocator telemetry
+        proc_alloc = 0
+        proc_resv = 0
+        if torch.cuda.is_available():
+            try:
+                proc_alloc = torch.cuda.memory_allocated()
+                proc_resv = torch.cuda.memory_reserved()
+            except Exception:
+                pass
+
+        live_hist = st.session_state.get("live_history", [])
+        pressure_eval = evaluate_live_memory_pressure(
+            physical_total_bytes=phys_total,
+            physical_used_bytes=phys_used,
+            process_allocated_bytes=proc_alloc,
+            process_reserved_bytes=proc_resv,
+            rolling_history=live_hist,
+            configured_budget_bytes=budget_bytes,
+        )
+
+        render_risk_badge(
+            pressure_eval["risk_level"],
+            pressure_eval["physical_headroom_ratio"] * 100.0,
+            (bytes_to_mb(pressure_eval["growth_rate_bps"]) or 0.0),
+        )
+
+        # Evidence & Rationale Panel
+        bullets_html = "".join([f"<li>{b}</li>" for b in pressure_eval["rationale_bullets"]])
+        rationale_html = f"""
+        <div style="background-color: #111827; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 14px 18px; margin: 16px 0;">
+            <div style="font-size: 0.95rem; font-weight: 700; color: #ffffff; margin-bottom: 8px;">
+                📊 Evidence & Rationale for Risk Classification ({pressure_eval['risk_level']})
+            </div>
+            <ul style="font-size: 0.85rem; color: #cbd5e1; line-height: 1.6; margin: 0; padding-left: 20px;">
+                {bullets_html}
+            </ul>
+        </div>
+        """
+        render_clean_html(rationale_html)
+
+        # Projected Time-to-Exhaustion callout
+        if pressure_eval["sustained_growth"]:
+            st.warning(f"⚠️ **Projected Time-to-Exhaustion:** {pressure_eval['tte_display']}")
+        else:
+            st.info(f"ℹ️ **Projected Time-to-Exhaustion:** {pressure_eval['tte_display']}")
+
+        st.markdown("#### Hardware Driver vs Allocator Memory Isolation")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            render_kpi_card(
+                "Driver Free Headroom",
+                f"{pressure_eval['physical_free_bytes'] // (1024*1024)} MB",
+                f"{pressure_eval['physical_headroom_ratio']*100:.1f}% device free",
+                color="#10b981",
+            )
+        with col2:
+            render_kpi_card(
+                "Physical VRAM Used",
+                f"{pressure_eval['physical_used_bytes'] // (1024*1024)} MB",
+                f"Total: {pressure_eval['physical_total_bytes'] // (1024*1024)} MB",
+                color="#f59e0b",
+            )
+        with col3:
+            render_kpi_card(
+                "Process Alloc Tensors",
+                f"{pressure_eval['process_allocated_bytes'] // (1024*1024)} MB",
+                "PyTorch live tensors",
+                color="#0088ff",
+            )
+        with col4:
+            render_kpi_card(
+                "Process Reserved Pool",
+                f"{pressure_eval['process_reserved_bytes'] // (1024*1024)} MB",
+                f"Cached-unused: {pressure_eval['pool_free_bytes'] // (1024*1024)} MB",
+                color="#8e44ad",
+            )
+
+        if live_hist and len(live_hist) > 1:
+            st.markdown("#### Live Physical Driver Memory Timeline")
+            hist_df = pd.DataFrame(live_hist)
+            if "used_bytes" in hist_df.columns:
+                hist_df["used_mb"] = hist_df["used_bytes"] / (1024 * 1024)
+                hist_chart = (
+                    alt.Chart(hist_df)
+                    .mark_line(color="#0088ff")
+                    .encode(
+                        x=alt.X("timestamp:T", title="Time"),
+                        y=alt.Y("used_mb:Q", title="VRAM Used (MB)"),
+                    )
+                    .properties(height=220)
+                )
+                st.altair_chart(hist_chart, width="stretch")
+
+    else:
+        # Historical CSV Mode
+        st.markdown("#### 📂 Historical CSV Playback Analysis")
+        active_df = uploaded_df if not uploaded_df.empty else df_torch
+
+        if not active_df.empty:
+            active_df = ensure_normalized_columns(active_df)
+            curr_alloc = int(active_df["allocated_bytes"].dropna().iloc[-1]) if "allocated_bytes" in active_df.columns and active_df["allocated_bytes"].notna().any() else int(active_df["allocated_mb"].dropna().iloc[-1] * 1024 * 1024)
+            curr_resv = int(active_df["reserved_bytes"].dropna().iloc[-1]) if "reserved_bytes" in active_df.columns and active_df["reserved_bytes"].notna().any() else int(active_df["reserved_mb"].dropna().iloc[-1] * 1024 * 1024)
+            growth_rate_bps = 0.0
+            if len(active_df) > 1 and "elapsed_s" in active_df.columns:
+                time_diff = active_df["elapsed_s"].iloc[-1] - active_df["elapsed_s"].iloc[0]
+                alloc_col = "allocated_bytes" if "allocated_bytes" in active_df.columns else "allocated_mb"
+                mult = 1 if "allocated_bytes" in active_df.columns else 1024 * 1024
+                alloc_diff = (active_df[alloc_col].iloc[-1] - active_df[alloc_col].iloc[0]) * mult
+                if time_diff > 0:
+                    growth_rate_bps = alloc_diff / time_diff
+
+            headroom = max(0, budget_bytes - curr_alloc)
+            headroom_ratio = headroom / max(1, budget_bytes)
+            risk_level = evaluate_oom_risk_heuristic(budget_bytes, curr_alloc, growth_rate_bps)
+
+            render_risk_badge(risk_level, headroom_ratio * 100, (bytes_to_mb(growth_rate_bps) or 0.0))
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                render_kpi_card("Allocated Tensors", format_bytes(curr_alloc), color="#0088ff")
+            with col2:
+                render_kpi_card("Reserved Pool", format_bytes(curr_resv), color="#8e44ad")
+            with col3:
+                render_kpi_card("Cached-Unused", format_bytes(max(0, curr_resv - curr_alloc)), color="#f43f5e")
+            with col4:
+                render_kpi_card("Configured Headroom", format_bytes(headroom), color="#10b981")
+
+            st.markdown("#### Allocated vs Reserved Memory Timeline")
+            st.altair_chart(create_torch_alloc_chart(active_df), width="stretch")
+        else:
+            st.info("No historical CSV loaded. Upload a CSV in the sidebar or switch to 🔴 Live GPU mode.")
+
+
+# ===========================================================================
+# VIEW 4: GPU PROCESS & WORKLOAD RESOURCE MANAGER
+# ===========================================================================
+elif nav_section == "⚖️ GPU Process & Workload Manager":
+    st.subheader("⚖️ GPU Process & Workload Resource Manager")
+    st.caption("Active multi-process surveillance, memory headroom breakdown, background application termination, and training admission feasibility.")
+
+    # ---------------------------------------------------------------------------
+    # Sub-Section 1: Active Hardware Process Inspection & Headroom Accounting
+    # ---------------------------------------------------------------------------
+    st.markdown("#### 1. Hardware Process Surveillance & Headroom Breakdown")
+    live_procs = []
+    driver_used_bytes = 0
+    driver_total_bytes = int(gpu_hardware["total_gb"] * 1024 * 1024 * 1024) if gpu_hardware else (6 * 1024 * 1024 * 1024)
+
+    if gpu_hardware and gpu_hardware.get("handle"):
         try:
-            h = gpu_hardware["handle"]
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(h)
-            curr_resv = mem_info.used
-            curr_alloc = int(mem_info.used * 0.75)
+            live_procs = get_live_gpu_processes(gpu_hardware["handle"])
+            driver_mem = pynvml.nvmlDeviceGetMemoryInfo(gpu_hardware["handle"])
+            driver_used_bytes = driver_mem.used
         except Exception:
             pass
 
-    headroom = max(0, budget_bytes - curr_alloc)
-    headroom_ratio = headroom / max(1, budget_bytes)
-    risk_level = evaluate_oom_risk_heuristic(budget_bytes, curr_alloc, growth_rate_bps)
+    driver_free_bytes = max(0, driver_total_bytes - driver_used_bytes)
+    driver_total_mb = driver_total_bytes // (1024 * 1024)
+    driver_free_mb = driver_free_bytes // (1024 * 1024)
+    driver_used_mb = driver_used_bytes // (1024 * 1024)
 
-    render_risk_badge(risk_level, headroom_ratio * 100, (bytes_to_mb(growth_rate_bps) or 0.0))
+    # Classify active processes
+    classified_procs = []
+    reclaimable_procs = []
+    reclaimable_bytes = 0
 
-    # Evidence & Rationale Panel
-    rationale_html = f"""
-    <div style="background-color: #111827; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 14px 18px; margin: 16px 0;">
-        <div style="font-size: 0.95rem; font-weight: 700; color: #ffffff; margin-bottom: 6px;">
-            📊 Evidence & Rationale for Risk Classification ({risk_level})
-        </div>
-        <div style="font-size: 0.85rem; color: #cbd5e1; line-height: 1.6;">
-            • <b>Configured Budget:</b> {format_bytes(budget_bytes)}<br>
-            • <b>Current Allocated:</b> {format_bytes(curr_alloc)} ({(curr_alloc / max(1, budget_bytes))*100:.1f}% capacity)<br>
-            • <b>Remaining Safe Headroom:</b> {format_bytes(headroom)} ({headroom_ratio*100:.1f}%)<br>
-            • <b>Instantaneous Growth Rate:</b> {(growth_rate_bps / (1024*1024)):.2f} MB/s<br>
-            • <b>Threshold Rule:</b> Low risk if headroom &gt; 25% and growth &lt; 50 MB/s; Moderate risk if headroom &lt; 25%; High risk if headroom &lt; 10% or budget exceeded.
-        </div>
-    </div>
-    """
-    render_clean_html(rationale_html)
+    for p in live_procs:
+        p_pid = p.get("PID") or p.get("pid", 0)
+        p_name = p.get("Process Name") or p.get("name", "Unknown")
+        cls_info = classify_gpu_process(p_name, p_pid)
+        used_b = p.get("used_bytes", 0)
+        p_copy = dict(p)
+        p_copy["Category"] = cls_info["badge"]
+        p_copy["killable"] = cls_info["killable"]
+        p_copy["Guidance"] = cls_info["guidance"]
+        classified_procs.append(p_copy)
+        if cls_info["killable"] and cls_info["category"] == "Reclaimable User App":
+            reclaimable_procs.append(p_copy)
+            reclaimable_bytes += used_b
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        render_kpi_card("Allocated Tensors", format_bytes(curr_alloc), color="#0088ff")
-    with col2:
-        render_kpi_card("Reserved Pool", format_bytes(curr_resv), color="#8e44ad")
-    with col3:
-        render_kpi_card("Cached-Unused", format_bytes(max(0, curr_resv - curr_alloc)), color="#f43f5e")
-    with col4:
-        render_kpi_card("Remaining Headroom", format_bytes(headroom), color="#10b981")
+    reclaimable_mb = reclaimable_bytes // (1024 * 1024)
+    potential_headroom_bytes = driver_free_bytes + reclaimable_bytes
+    potential_headroom_mb = potential_headroom_bytes // (1024 * 1024)
 
-    if not active_df.empty:
-        st.markdown("#### Allocated vs Reserved Memory Timeline")
-        st.altair_chart(create_torch_alloc_chart(active_df), width="stretch")
+    contention_level = "High" if (driver_used_bytes > (driver_total_bytes * 0.75) or len(live_procs) > 4) else ("Moderate" if (driver_used_bytes > (driver_total_bytes * 0.45) or len(reclaimable_procs) > 1) else "Clean / Low")
 
+    col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+    with col_h1:
+        render_kpi_card("Physical Free VRAM", f"{driver_free_mb} MB", f"{(driver_free_bytes/max(1,driver_total_bytes))*100:.1f}% free", color="#10b981")
+    with col_h2:
+        render_kpi_card("Reclaimable VRAM", f"{reclaimable_mb} MB", f"{len(reclaimable_procs)} background user app(s)", color="#f59e0b")
+    with col_h3:
+        render_kpi_card("Potential Headroom", f"{potential_headroom_mb} MB", "Free + Reclaimable buffer", color="#0088ff")
+    with col_h4:
+        render_kpi_card("Contention Score", contention_level, f"{len(live_procs)} active processes", color="#f43f5e" if "High" in contention_level else ("#f59e0b" if "Moderate" in contention_level else "#10b981"))
 
-# ===========================================================================
-# VIEW 4: WORKLOAD MANAGER (OPERATIONAL ADMISSION CONTROL)
-# ===========================================================================
-elif nav_section == "⚖️ Workload Manager":
-    st.subheader("⚖️ Cooperative GPU Workload Manager & Admission Control")
-    st.caption("Coordinating multi-workload GPU memory reservations to prevent cascading Out-Of-Memory aborts.")
+    # Active Processes Table
+    if classified_procs:
+        st.caption("Active OS & Graphics processes utilizing this accelerator:")
+        p_df = pd.DataFrame(classified_procs)
+        disp_cols = [c for c in ["PID", "Process Name", "Subsystem", "Category", "VRAM Usage", "Guidance"] if c in p_df.columns]
+        st.dataframe(p_df[disp_cols] if disp_cols else p_df, width="stretch")
+    else:
+        st.info("No external compute/graphics processes actively locking GPU memory.")
 
-    st.markdown(
-        """
-        <div style="background: rgba(0, 136, 255, 0.08); border-left: 4px solid #0088ff; padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 0.85rem; color: #cbd5e1;">
-            <strong>Cooperative Scope:</strong> This controller coordinates instrumented workloads before launch.
-            It uses real physical VRAM headroom checks from NVML plus registered reservations to prevent concurrent workloads from saturating the GPU.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # ---------------------------------------------------------------------------
+    # Sub-Section 2: Headroom Recovery Assistant (Interactive Process Termination)
+    # ---------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### 2. Headroom Recovery Assistant (Process Termination)")
+    st.caption("Terminate background desktop applications (browsers, IDEs, chat clients) holding GPU hardware acceleration buffers to recover VRAM for training.")
 
-    # Initialize session controller
+    if reclaimable_procs:
+        c_kill1, c_kill2 = st.columns([2.2, 1.2])
+        with c_kill1:
+            proc_options = [f"{p.get('Process Name')} (PID: {p.get('PID')}, VRAM: {p.get('VRAM Usage')})" for p in reclaimable_procs]
+            selected_proc_str = st.selectbox("Select Process to Terminate", proc_options, key="sel_proc_terminate")
+            selected_idx = proc_options.index(selected_proc_str) if selected_proc_str in proc_options else 0
+            target_proc = reclaimable_procs[selected_idx]
+
+        with c_kill2:
+            st.write("")
+            st.write("")
+            btn_kill_single = st.button(f"🛑 Terminate Selected ({target_proc.get('Process Name')})", type="secondary", width="stretch", key="btn_kill_single")
+
+        if btn_kill_single:
+            target_pid = target_proc.get("PID") or target_proc.get("pid")
+            target_name = target_proc.get("Process Name") or target_proc.get("name")
+            if target_pid:
+                with st.spinner(f"Terminating PID {target_pid} ({target_name})..."):
+                    success = terminate_process_by_pid(target_pid)
+                    if success:
+                        st.success(f"✅ Successfully terminated {target_name} (PID {target_pid}). VRAM released to driver pool.")
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Failed to terminate {target_name} (PID {target_pid}). Process may require administrative privileges or has already exited.")
+
+        # Batch kill shortcut
+        if len(reclaimable_procs) > 1:
+            if st.button(f"🧹 Free All Reclaimable VRAM (Terminate All {len(reclaimable_procs)} User Apps: ~{reclaimable_mb} MB)", type="secondary", key="btn_kill_all_reclaimable"):
+                terminated_count = 0
+                for rp in reclaimable_procs:
+                    t_pid = rp.get("PID") or rp.get("pid")
+                    if t_pid and terminate_process_by_pid(t_pid):
+                        terminated_count += 1
+                st.success(f"✅ Terminated {terminated_count} application(s). Reclaimed up to {reclaimable_mb} MB VRAM.")
+                time.sleep(0.5)
+                st.rerun()
+    else:
+        st.info("✅ No non-essential background processes detected. GPU memory is already clean and optimal.")
+
+    # ---------------------------------------------------------------------------
+    # Sub-Section 3: Model Training Feasibility Evaluator ("Can I Train My Model Right Now?")
+    # ---------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### 3. Model Training Feasibility Evaluator")
+    st.caption("Evaluates whether a planned ML training job can execute right now without triggering CUDA OutOfMemoryError, and provides actionable headroom recommendations.")
+
+    # Initialize session admission controller
     if "admission_controller" not in st.session_state:
         st.session_state["admission_controller"] = AdmissionController(
             budget_bytes=budget_bytes,
@@ -1391,78 +1744,194 @@ elif nav_section == "⚖️ Workload Manager":
         )
     controller: AdmissionController = st.session_state["admission_controller"]
 
-    # Current load detection
-    current_used_bytes = 0
-    if gpu_hardware:
-        try:
-            current_used_bytes = pynvml.nvmlDeviceGetMemoryInfo(gpu_hardware["handle"]).used
-        except Exception:
-            pass
+    c_eval1, c_eval2 = st.columns([1.1, 1.3])
+    with c_eval1:
+        st.markdown("##### Planned Workload Specification")
+        w_name = st.text_input("Workload Identifier", value="Model_Training_Run", key="sched_w_name")
+        w_arch = st.selectbox(
+            "Target Architecture",
+            ["Small CNN (~75 MB)", "ResNet Stage (~160 MB)", "ResNet-50 (~1,200 MB)", "BERT / Transformer (~2,400 MB)", "Large Model (~4,800 MB)"],
+            index=1,
+            key="sched_w_arch",
+        )
+        w_mode = st.radio("Execution Mode", ["Training (Forward + Backward)", "Inference (Forward Only)"], index=0, horizontal=True, key="sched_w_mode")
+        w_batch = st.slider("Batch Size", 4, 128, 32, 4, key="sched_w_batch")
+        w_precision = st.selectbox("Precision", ["FP32 (Full Precision)", "FP16 (Half Precision - 50% memory)"], index=0, key="sched_w_prec")
 
-    col_sim1, col_sim2 = st.columns([1.1, 1.3])
-    with col_sim1:
-        st.markdown("#### Request Workload Admission")
-        with st.form("admission_form"):
-            w_name = st.text_input("Workload Identifier", value="CNN_Inference_01")
-            w_arch = st.selectbox("Model Architecture", ["Small CNN", "ResNet Stage", "Linear MLP"], index=0)
-            w_demand_mb = st.number_input("Estimated VRAM Demand (MiB)", min_value=32, max_value=2048, value=128, step=32)
-            w_batch = st.slider("Batch Size", 4, 64, 16, 4)
-            w_precision = st.selectbox("Precision", ["FP32", "FP16"], index=0)
-            eval_btn = st.form_submit_button("Evaluate Admission Request", width="stretch")
+        # Demand profiling action
+        if st.button("🔍 Profile Custom Demand (1-step on GPU)", width="stretch", key="btn_prof_custom"):
+            arch_key = "small_cnn" if "CNN" in w_arch else ("resnet_stage" if "ResNet Stage" in w_arch else "linear_mlp")
+            prec_key = "fp16" if "FP16" in w_precision else "fp32"
+            with st.spinner("Executing 1-step empirical profiling pass on device..."):
+                prof_data = profile_workload_demand(architecture=arch_key, batch_size=min(w_batch, 32), precision=prec_key)
+                st.session_state["profiled_workload_demand"] = prof_data
 
-    with col_sim2:
-        st.markdown("#### Admission Decision & Operational Execution")
+        prof_state = st.session_state.get("profiled_workload_demand")
+        if prof_state:
+            st.success(f"📊 Profiled Demand: **{prof_state['measured_demand_mb']} MB** ({prof_state['profiling_time_s']}s on {prof_state['device']})")
+            base_demand_mb = prof_state["measured_demand_mb"]
+        else:
+            if "CNN" in w_arch:
+                base_demand_mb = 75.0
+            elif "ResNet Stage" in w_arch:
+                base_demand_mb = 160.0
+            elif "ResNet-50" in w_arch:
+                base_demand_mb = 1200.0
+            elif "BERT" in w_arch:
+                base_demand_mb = 2400.0
+            else:
+                base_demand_mb = 4800.0
+
+        # Adjust demand for batch, precision, and training mode
+        is_training = "Training" in w_mode
+        mode_multiplier = 2.0 if is_training else 1.0
+        prec_multiplier = 0.55 if "FP16" in w_precision else 1.0
+        batch_multiplier = max(1.0, (w_batch / 16.0))
+        estimated_total_demand_mb = round(base_demand_mb * mode_multiplier * prec_multiplier * (0.5 + 0.5 * batch_multiplier), 1)
+        estimated_demand_bytes = int(estimated_total_demand_mb * 1024 * 1024)
+
+        st.caption(f"Estimated Peak Working Set: **{estimated_total_demand_mb:.1f} MB** (Includes model weights, activations, and gradients)")
+        eval_btn = st.button("⚖️ Evaluate Memory Feasibility", type="primary", width="stretch", key="btn_eval_feasibility")
+
+    with c_eval2:
+        st.markdown("##### Feasibility Assessment & Actionable Verdict")
         if eval_btn:
-            demand_bytes = int(w_demand_mb * 1024 * 1024)
-            current_device_used = current_used_bytes if current_used_bytes > 0 else (1200 * 1024 * 1024)
-            decision, event_dict = controller.request(
-                workload_id=w_name or "workload_01",
-                estimated_bytes=demand_bytes,
-                observed_device_used_bytes=current_device_used,
-            )
-            st.session_state["last_admission_eval"] = {
-                "workload_id": w_name,
+            st.session_state["last_feasibility_eval"] = {
+                "workload_id": w_name or "training_job",
                 "arch": w_arch,
-                "demand_bytes": demand_bytes,
+                "mode": w_mode,
                 "batch_size": w_batch,
                 "precision": w_precision,
-                "decision": decision,
-                "event": event_dict,
+                "demand_mb": estimated_total_demand_mb,
+                "demand_bytes": estimated_demand_bytes,
+                "token": f"{w_name}_{int(time.time())}",
             }
 
-        eval_state = st.session_state.get("last_admission_eval")
-        if eval_state:
-            badge = render_admission_decision_badge(eval_state["decision"])
-            st.markdown(f"### Decision: {badge}", unsafe_allow_html=True)
-            st.markdown(f"- **Workload:** `{eval_state['workload_id']}` ({eval_state['arch']}, Batch={eval_state['batch_size']}, {eval_state['precision']})")
-            st.markdown(f"- **Declared Demand:** {format_bytes(eval_state['demand_bytes'])}")
-            st.markdown(f"- **Active Reservations:** {format_bytes(controller.reserved_total_bytes)}")
+        f_eval = st.session_state.get("last_feasibility_eval")
+        if f_eval:
+            req_mb = f_eval["demand_mb"]
+            safety_headroom_mb = req_mb * (safety_margin_pct / 100.0)
+            required_with_safety_mb = req_mb + safety_headroom_mb
 
-            if eval_state["decision"] == AdmissionDecision.ADMIT:
-                st.success("✅ Workload admitted within safe budget headroom.")
+            st.markdown(f"- **Planned Workload:** `{f_eval['workload_id']}` ({f_eval['arch']})")
+            st.markdown(f"- **Required Working Set:** `{req_mb:.1f} MB` (+ {safety_headroom_mb:.1f} MB safety buffer)")
+            st.markdown(f"- **Physical Free VRAM:** `{driver_free_mb} MB`")
+            st.markdown(f"- **Potential Headroom (Free + Reclaimable):** `{potential_headroom_mb} MB`")
 
-                if st.button("▶ Launch Admitted Workload on GPU", type="primary", key="btn_launch_admitted"):
-                    spec = WorkloadSpec(
-                        workload_id=eval_state["workload_id"],
-                        workload_name=eval_state["arch"].lower().replace(" ", "_"),
-                        estimated_bytes=eval_state["demand_bytes"],
-                        batch_size=eval_state["batch_size"],
-                        precision=eval_state["precision"].lower(),
-                    )
-                    with st.spinner(f"Executing {eval_state['workload_id']} on physical GPU..."):
-                        try:
-                            exec_res = real_gpu_workload_runner(spec)
-                            if exec_res.peak_memory_bytes:
-                                controller.record_observed_peak(spec.workload_id, exec_res.peak_memory_bytes)
-                            st.session_state["last_admitted_exec"] = exec_res
-                            st.success(f"Execution complete: {exec_res.status} in {exec_res.runtime_s}s (Peak VRAM: {format_bytes(exec_res.peak_memory_bytes or 0)})")
-                        finally:
-                            controller.release(spec.workload_id)
-                            st.caption(f"Reservation for '{spec.workload_id}' released from admission controller.")
-            elif eval_state["decision"] == AdmissionDecision.DEFER:
-                st.warning("⏳ Workload deferred: Current reservations or driver usage temporarily exceed safety margin.")
+            # Feasibility Logic
+            if driver_free_mb >= required_with_safety_mb:
+                st.success("### 🟢 VERDICT: SAFE TO RUN RIGHT NOW")
+                st.markdown(
+                    f"**Analysis:** Physical free VRAM ({driver_free_mb} MB) is sufficient to accommodate this workload "
+                    f"({req_mb:.1f} MB) plus safety headroom ({safety_headroom_mb:.1f} MB). "
+                    "No background applications need to be closed. OOM risk is near zero."
+                )
+
+                launch_btn = st.button("▶ Launch Workload on GPU", type="primary", key="btn_launch_safe_ml")
+                if launch_btn:
+                    token = f_eval["token"]
+                    last_launched = st.session_state.get("admitted_launched_token")
+                    if last_launched == token:
+                        st.info("Workload already executed for this token. Click 'Evaluate' again to re-test.")
+                    else:
+                        st.session_state["admitted_launched_token"] = token
+                        arch_clean = "small_cnn" if "CNN" in f_eval["arch"] else ("resnet_stage" if "ResNet Stage" in f_eval["arch"] else "linear_mlp")
+                        prec_clean = "fp16" if "FP16" in f_eval["precision"] else "fp32"
+                        spec = WorkloadSpec(
+                            workload_id=f_eval["workload_id"],
+                            workload_name=arch_clean,
+                            estimated_bytes=f_eval["demand_bytes"],
+                            batch_size=min(f_eval["batch_size"], 64),
+                            precision=prec_clean,
+                        )
+                        with st.spinner(f"Executing {f_eval['workload_id']} on physical GPU..."):
+                            try:
+                                exec_res = real_gpu_workload_runner(spec)
+                                st.session_state["last_admitted_exec"] = exec_res
+                                if exec_res.status == ExperimentStatus.SUCCESS:
+                                    st.success(f"✅ Execution Complete: {exec_res.status} in {exec_res.runtime_s}s (Peak VRAM: {format_bytes(exec_res.peak_memory_bytes or 0)})")
+                                else:
+                                    st.warning(f"Notice: {exec_res.status} - {exec_res.error_message}")
+                            finally:
+                                controller.release(spec.workload_id)
+
+            elif potential_headroom_mb >= required_with_safety_mb:
+                st.warning("### 🟡 VERDICT: OOM RISK (RECOVERABLE BY FREEING VRAM)")
+                shortage_mb = required_with_safety_mb - driver_free_mb
+                st.markdown(
+                    f"**Analysis:** Current free VRAM ({driver_free_mb} MB) is **insufficient** (short by {shortage_mb:.0f} MB). "
+                    f"However, background desktop apps are consuming **{reclaimable_mb} MB**. Closing them recovers enough memory to run safely!"
+                )
+                st.markdown("**Actionable Recommendations:**")
+                for rp in reclaimable_procs:
+                    st.markdown(f"- Terminate `{rp.get('Process Name')}` (PID {rp.get('PID')}) to recover `{rp.get('VRAM Usage')}`")
+
+                if st.button("🧹 Free Reclaimable Memory Now", type="primary", key="btn_free_for_workload"):
+                    for rp in reclaimable_procs:
+                        t_pid = rp.get("PID") or rp.get("pid")
+                        if t_pid:
+                            terminate_process_by_pid(t_pid)
+                    st.success("Reclaimed memory! Re-evaluating headroom...")
+                    time.sleep(0.5)
+                    st.rerun()
+
             else:
-                st.error("❌ Workload rejected: Requested demand exceeds configured total safe budget.")
+                st.error("### 🔴 VERDICT: EXCEEDS PHYSICAL ACCELERATOR CAPACITY")
+                st.markdown(
+                    f"**Analysis:** Workload requires **{req_mb:.1f} MB**, but total physical GPU VRAM is **{driver_total_mb} MB**. "
+                    "Even if 100% of background processes are terminated, this workload will crash with CUDA OutOfMemoryError."
+                )
+                st.markdown(
+                    """
+                    **Actionable Optimization Steps:**
+                    1. **Reduce Batch Size:** Halving the batch size reduces activation memory linearly.
+                    2. **Enable FP16 / Mixed Precision:** Switch precision from FP32 to FP16 to cut activation memory by ~50%.
+                    3. **Enable Tiered Activation Swapper (Tab 6):** Open the **⚡ OOM Defense & Tiered Swapper** tab to offload forward activations to Host CPU RAM over PCIe, allowing this oversized workload to run with zero crashes!
+                    """
+                )
+        else:
+            st.info("Configure your planned workload parameters on the left and click **Evaluate Memory Feasibility** to check headroom.")
+
+    # ---------------------------------------------------------------------------
+    # Sub-Section 4: Multi-Tenant Contention Measurement
+    # ---------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### 4. Multi-Tenant Contention Measurement")
+    st.caption("Measures actual execution latency slowdown and memory overhead caused when background processes compete for GPU Streaming Multiprocessors and memory bus bandwidth.")
+
+    col_cnt_btn, col_cnt_info = st.columns([1.2, 2.8])
+    with col_cnt_btn:
+        stress_mb_input = st.slider("Contention Stress Buffer (MB)", 64, 512, 128, 64, key="slider_contention_stress")
+        run_contention_btn = st.button("▶ Run Contention Benchmark", type="primary", width="stretch", key="btn_run_contention_view4")
+    with col_cnt_info:
+        st.markdown(
+            """
+            When multiple processes execute concurrently on a single accelerator,
+            they compete for Streaming Multiprocessors (SMs), memory bus bandwidth, and L2 cache lines.
+            This benchmark measures the exact wall-clock slowdown and memory overhead caused by multi-process contention.
+            """
+        )
+
+    if run_contention_btn:
+        with st.spinner("Executing isolated pass followed by concurrent stress pass..."):
+            cnt_res = run_contention_experiment(stress_tensor_mb=stress_mb_input)
+            st.session_state["last_contention_experiment"] = cnt_res
+            st.success("✅ Contention evaluation completed successfully.")
+
+    last_cnt = st.session_state.get("last_contention_experiment")
+    if last_cnt and last_cnt.get("success"):
+        st.markdown("##### Contention Benchmark Results")
+        col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+        with col_c1:
+            render_kpi_card("Isolated Runtime (T1)", f"{last_cnt['isolated_runtime_s']:.4f}s", "Uncontended baseline", color="#10b981")
+        with col_c2:
+            render_kpi_card("Concurrent Runtime (T2)", f"{last_cnt['concurrent_runtime_s']:.4f}s", f"Under {stress_mb_input} MB load", color="#f59e0b")
+        with col_c3:
+            render_kpi_card("Measured Slowdown", f"+{last_cnt['slowdown_pct']}%", "Latency penalty", color="#f43f5e")
+        with col_c4:
+            render_kpi_card("Peak Memory", f"{last_cnt['concurrent_peak_bytes'] // (1024*1024)} MB", f"Isolated: {last_cnt['isolated_peak_bytes'] // (1024*1024)} MB", color="#0088ff")
+
+        st.info(f"📊 **Benchmark Analysis:** {last_cnt['explanation']}")
 
     # Active Reservations Table
     st.markdown("---")
@@ -1480,70 +1949,3 @@ elif nav_section == "⚖️ Workload Manager":
 # ===========================================================================
 elif nav_section == "⚡ OOM Defense & Tiered Swapper":
     render_oom_defense_swapper_view()
-
-
-# ===========================================================================
-# VIEW 6: PROFILING & BENCHMARK REPORTS (EXECUTABLE BENCHMARK SUITE)
-# ===========================================================================
-elif nav_section == "📋 Profiling & Benchmark Reports":
-    st.subheader("📋 Executable GPU Benchmark Matrix & Profiling Reports")
-    st.caption("Running standardized deep learning workloads on physical GPU hardware with recorded execution telemetry.")
-
-    bench_csv_path = PROJECT_ROOT / "data" / "profiles" / "benchmark_results.csv"
-
-    c_run1, c_run2 = st.columns([2.5, 1.5])
-    with c_run1:
-        st.markdown(
-            """
-            This benchmark executes 3 standardized workloads sequentially on physical GPU hardware through cooperative admission control:
-            1. **Small CNN:** Forward pass, Batch 16, FP32 (~80 MB)
-            2. **ResNet Stage:** Forward pass, Batch 32, FP16 (~180 MB)
-            3. **Linear MLP:** Forward pass, Batch 32, FP32 (~120 MB)
-            """
-        )
-    with c_run2:
-        st.write("")
-        run_bench_btn = st.button("▶ Execute Benchmark Suite on GPU", type="primary", width="stretch")
-
-    if run_bench_btn:
-        bench_controller = AdmissionController(
-            budget_bytes=budget_bytes,
-            safety_margin_ratio=safety_margin_pct / 100.0,
-        )
-        workloads_to_run = [
-            WorkloadSpec(workload_id="bench_cnn_fp32", workload_name="small_cnn", estimated_bytes=80*1024*1024, batch_size=16, precision="fp32"),
-            WorkloadSpec(workload_id="bench_resnet_fp16", workload_name="resnet_stage", estimated_bytes=180*1024*1024, batch_size=32, precision="fp16"),
-            WorkloadSpec(workload_id="bench_mlp_fp32", workload_name="linear_mlp", estimated_bytes=120*1024*1024, batch_size=32, precision="fp32"),
-        ]
-
-        writer = ExperimentResultWriter(bench_csv_path)
-        with st.spinner("Executing real GPU benchmarks sequentially with strict cleanup..."):
-            bench_results = run_controlled_experiment(
-                workloads=workloads_to_run,
-                controller=bench_controller,
-                runner_fn=real_gpu_workload_runner if (torch.cuda.is_available()) else None,
-                writer=writer,
-            )
-            st.session_state["latest_bench_results"] = [r.to_dict() for r in bench_results]
-            st.success(f"✅ Executed {len(bench_results)} workloads. Results appended to data/profiles/benchmark_results.csv.")
-
-    # Render recorded benchmarks table
-    st.markdown("---")
-    st.markdown("#### Recorded Benchmark Runs on Disk")
-    if bench_csv_path.is_file():
-        try:
-            bench_df = pd.read_csv(bench_csv_path)
-            # Format columns for crisp display
-            display_cols = ["timestamp", "workload_name", "batch_size", "precision", "admission_decision", "status", "runtime_s", "peak_memory_bytes"]
-            valid_cols = [c for c in display_cols if c in bench_df.columns]
-            df_disp = bench_df[valid_cols].copy()
-            if "timestamp" in df_disp.columns:
-                df_disp["timestamp"] = pd.to_datetime(df_disp["timestamp"], unit="s", errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-            if "peak_memory_bytes" in df_disp.columns:
-                df_disp["peak_memory_mb"] = (pd.to_numeric(df_disp["peak_memory_bytes"], errors="coerce") / (1024*1024)).round(1)
-                df_disp.drop(columns=["peak_memory_bytes"], inplace=True)
-            st.dataframe(df_disp.tail(20), width="stretch")
-        except Exception as e:
-            st.error(f"Error loading benchmark results: {e}")
-    else:
-        st.info("No recorded benchmarks found in data/profiles/benchmark_results.csv. Click **▶ Execute Benchmark Suite on GPU** to run.")

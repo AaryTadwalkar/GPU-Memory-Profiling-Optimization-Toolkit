@@ -95,18 +95,23 @@ class ExperimentStatus:
     1. The use of class:
        Provides named string constants for experiment run outcomes.
     2. What the class contains:
-       SUCCESS, FAILED, DEFERRED, REJECTED, OOM.
-    3. Key design:
+       SUCCESS, FAILED, DEFERRED, REJECTED, OOM, SKIPPED, EXECUTION_ERROR.
+    3. Technologies used and why:
+       Static string constants without external enum overhead for high-performance logging.
+    4. Key design and overall design of the class:
        Maintains distinct semantics between runtime failure (FAILED), out-of-memory
-       failure (OOM), admission deferral (DEFERRED), and policy rejection (REJECTED).
+       failure (OOM), admission deferral (DEFERRED), policy rejection (REJECTED),
+       pre-execution skip (SKIPPED), and internal execution exception (EXECUTION_ERROR).
     """
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     DEFERRED = "DEFERRED"
     REJECTED = "REJECTED"
     OOM = "OOM"
+    SKIPPED = "SKIPPED"
+    EXECUTION_ERROR = "EXECUTION_ERROR"
 
-    ALL_STATUSES = {SUCCESS, FAILED, DEFERRED, REJECTED, OOM}
+    ALL_STATUSES = {SUCCESS, FAILED, DEFERRED, REJECTED, OOM, SKIPPED, EXECUTION_ERROR}
 
 
 # ---------------------------------------------------------------------------

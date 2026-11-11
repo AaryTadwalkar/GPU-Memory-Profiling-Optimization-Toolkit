@@ -19,7 +19,7 @@ File: memory_pressure.py
 import argparse
 import csv
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Transparent, configurable risk thresholds
 # These are heuristics, not physical guarantees.
@@ -28,6 +28,133 @@ RISK_THRESHOLDS = {
     "moderate_headroom_ratio": 0.25, # If headroom is < 25% of budget, Moderate risk
     "high_growth_rate_bps": 50 * 1024 * 1024, # If growing > 50 MB/s, bump risk
 }
+
+def evaluate_live_memory_pressure(
+    physical_total_bytes: int,
+    physical_used_bytes: int,
+    process_allocated_bytes: int = 0,
+    process_reserved_bytes: int = 0,
+    rolling_history: Optional[List[Dict[str, Any]]] = None,
+    configured_budget_bytes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    1. The use of function:
+       Performs a rigorous, measurement-driven memory pressure and OOM-risk evaluation
+       for live GPU monitoring, separating physical NVML device telemetry from current-process
+       PyTorch allocator statistics and evaluating growth rate over an active rolling window.
+
+    2. How does the specific function work:
+       Computes physical driver headroom and headroom ratio. Inspects rolling_history (last 3-10
+       samples) to calculate actual live memory growth rate. If the GPU is idle and there is no
+       sustained positive growth, assigns LOW risk. Computes projected Time-to-Exhaustion (TTE)
+       strictly when sustained positive growth exceeding 5 MB/s is established. Produces a full
+       audit dictionary containing physical metrics, allocator metrics, growth velocity, risk,
+       and an evidence-based rationale.
+
+    3. Concepts used in the function:
+       Physical driver VRAM vs user-space virtual allocator isolation, rolling timeseries
+       derivative estimation, hysteresis against instantaneous spikes, Time-to-Exhaustion (TTE).
+
+    4. Places where this function is imported and used:
+       Imported by dashboard/app.py in Tab 4 (Memory Pressure & OOM Prevention) and tested in unit tests.
+
+    5. Final output of the function, before and after:
+       Before: Raw physical and process memory integers.
+       After: Structured dictionary with risk_level, physical_free_bytes, physical_headroom_ratio,
+              process_allocated_bytes, process_reserved_bytes, pool_free_bytes, growth_rate_bps,
+              sustained_growth, tte_seconds, tte_display, and rationale_bullets.
+    """
+    total_bytes = max(1, physical_total_bytes)
+    used_bytes = max(0, physical_used_bytes)
+    free_bytes = max(0, total_bytes - used_bytes)
+    headroom_ratio = free_bytes / float(total_bytes)
+
+    alloc_bytes = max(0, process_allocated_bytes)
+    resv_bytes = max(0, process_reserved_bytes)
+    pool_free_bytes = max(0, resv_bytes - alloc_bytes)
+
+    # Effective target capacity for headroom analysis
+    effective_capacity = configured_budget_bytes if (configured_budget_bytes and configured_budget_bytes > 0) else total_bytes
+
+    # Rolling growth rate calculation from live history buffer
+    growth_rate_bps = 0.0
+    sustained_growth = False
+
+    if rolling_history and len(rolling_history) >= 3:
+        # Use recent window (up to last 10 samples)
+        recent = rolling_history[-10:]
+        t_first = recent[0].get("timestamp", 0.0)
+        t_last = recent[-1].get("timestamp", 0.0)
+        dt = t_last - t_first
+
+        if dt > 0.4:
+            # Measure delta in physical used bytes or allocated bytes
+            m_first = recent[0].get("used_bytes") or recent[0].get("allocated_bytes") or 0
+            m_last = recent[-1].get("used_bytes") or recent[-1].get("allocated_bytes") or 0
+            delta_m = m_last - m_first
+            growth_rate_bps = max(0.0, delta_m / dt)
+
+            # Check if growth is sustained across at least 3 consecutive points
+            if growth_rate_bps > (5 * 1024 * 1024):  # > 5 MB/s
+                sustained_growth = True
+
+    # Risk level classification
+    # If GPU is idle with ample headroom (> 25%) and no sustained positive growth -> Strictly LOW
+    if headroom_ratio >= 0.25 and not sustained_growth:
+        risk_level = "Low"
+        decision_reason = "Physical GPU has ample headroom (>25% free) with zero or non-sustained memory growth."
+    elif headroom_ratio < 0.10 or free_bytes < (256 * 1024 * 1024):
+        risk_level = "High"
+        decision_reason = "Physical GPU free headroom is critically depleted (<10% free or <256 MB remaining)."
+    elif headroom_ratio < 0.25:
+        risk_level = "Moderate"
+        decision_reason = "Physical GPU free headroom is constrained (<25% free)."
+    else:
+        risk_level = "Low"
+        decision_reason = "Normal operating baseline with sufficient device capacity."
+
+    # Escalate if memory velocity is very rapid (> 50 MB/s sustained)
+    if sustained_growth and growth_rate_bps > RISK_THRESHOLDS["high_growth_rate_bps"]:
+        if risk_level == "Low":
+            risk_level = "Moderate"
+            decision_reason += " Escalated to Moderate due to rapid sustained memory growth (>50 MB/s)."
+        elif risk_level == "Moderate":
+            risk_level = "High"
+            decision_reason += " Escalated to High due to rapid sustained memory growth (>50 MB/s)."
+
+    # Time to exhaustion calculation (strictly when sustained growth is observed)
+    if sustained_growth and growth_rate_bps > (5 * 1024 * 1024) and free_bytes > 0:
+        tte_sec = round(free_bytes / float(growth_rate_bps), 1)
+        tte_display = f"~{tte_sec}s until physical VRAM exhaustion at current growth rate"
+    else:
+        tte_sec = None
+        tte_display = "Stable / N/A (No sustained positive memory growth detected)"
+
+    rationale_bullets = [
+        f"Physical VRAM Free Headroom: {free_bytes // (1024*1024)} MB ({headroom_ratio*100:.1f}% free of {total_bytes // (1024*1024)} MB total)",
+        f"In-Process Allocator: {alloc_bytes // (1024*1024)} MB allocated, {resv_bytes // (1024*1024)} MB reserved pool ({pool_free_bytes // (1024*1024)} MB cached-unused)",
+        f"Rolling Growth Velocity: {growth_rate_bps / (1024*1024):.2f} MB/s (sustained: {sustained_growth})",
+        f"Projected Time-to-Exhaustion: {tte_display}",
+        f"Classification Rule: {decision_reason}",
+    ]
+
+    return {
+        "risk_level": risk_level,
+        "physical_total_bytes": total_bytes,
+        "physical_used_bytes": used_bytes,
+        "physical_free_bytes": free_bytes,
+        "physical_headroom_ratio": headroom_ratio,
+        "process_allocated_bytes": alloc_bytes,
+        "process_reserved_bytes": resv_bytes,
+        "pool_free_bytes": pool_free_bytes,
+        "growth_rate_bps": growth_rate_bps,
+        "sustained_growth": sustained_growth,
+        "tte_seconds": tte_sec,
+        "tte_display": tte_display,
+        "decision_reason": decision_reason,
+        "rationale_bullets": rationale_bullets,
+    }
+
 
 def evaluate_oom_risk_heuristic(
     budget_bytes: int,

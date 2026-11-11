@@ -711,3 +711,48 @@ class TestLive1MinBenchmark:
         assert d["vram_used_mb"] == 5400.0
         assert d["status"] == "RUNNING"
 
+    def test_run_live_benchmark_distinct_modes(self) -> None:
+        """
+        1. The use of function:
+           Tests isolated execution of baseline_only and swapper_only demo modes.
+
+        2. How does the specific function work:
+           Invokes `run_live_1min_benchmark` with mode='baseline_only' and mode='swapper_only',
+           verifying that each mode executes its respective phase independently.
+
+        3. Concepts used in the function:
+           Mode-separated benchmarking, modular execution pathways, unit verification.
+
+        4. Places where this function is imported and used:
+           Executed by pytest test runner.
+
+        5. Final output of the function, before and after:
+           Before: Unverified distinct benchmark modes.
+           After: Verified independent execution of baseline_only and swapper_only modes.
+        """
+        b_summary = run_live_1min_benchmark(
+            device_name="cpu",
+            simulate=True,
+            phase1_duration_s=1.0,
+            batch_p1=16,
+            model_type="mlp",
+            simulate_oom_on_baseline=False,
+            mode="baseline_only",
+        )
+        assert b_summary.phase1_duration_s > 0.0
+        assert b_summary.phase2_duration_s == 0.0
+        assert all(r["phase_id"] == 1 for r in b_summary.records)
+
+        s_summary = run_live_1min_benchmark(
+            device_name="cpu",
+            simulate=True,
+            phase2_duration_s=1.0,
+            batch_p2=32,
+            model_type="mlp",
+            mode="swapper_only",
+        )
+        assert s_summary.phase1_duration_s == 0.0
+        assert s_summary.phase2_duration_s > 0.0
+        assert all(r["phase_id"] == 2 for r in s_summary.records)
+
+
